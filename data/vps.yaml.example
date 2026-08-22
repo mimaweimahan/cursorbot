@@ -1,0 +1,21 @@
+# 由 Bot 添加时会把密码加密成 passwordEnc。不要把明文密码提交进仓库。
+# 若手工写 password: 明文，Bot 启动时会自动改成 passwordEnc。
+
+hosts:
+  - id: web-1
+    name: 生产 Web
+    host: 203.0.113.10
+    port: 22
+    user: root
+    passwordEnc: v1.xxxx.xxxx.xxxx
+    tags: [prod, nginx]
+    notes: nginx + 静态站
+    writable: true
+
+  - id: db-1
+    name: 密钥登录示例
+    host: 203.0.113.11
+    port: 22
+    user: ubuntu
+    identityFile: /root/.ssh/id_ed25519
+    writable: false

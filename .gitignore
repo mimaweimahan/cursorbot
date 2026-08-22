@@ -1,0 +1,10 @@
+node_modules
+dist
+.env
+data/vps.yaml
+data/codehub.yaml
+data/repos.yaml
+data/sessions.json
+data/audit.jsonl
+workspaces/*
+!workspaces/.gitkeep

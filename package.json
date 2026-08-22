@@ -1,0 +1,29 @@
+{
+  "name": "telegrambot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1116.0",
+    "@cursor/sdk": "^1.0.6",
+    "dotenv": "^16.6.1",
+    "grammy": "^1.38.3",
+    "js-yaml": "^4.1.0",
+    "ssh2": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.17.2",
+    "@types/ssh2": "^1.15.5",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
