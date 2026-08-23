@@ -61,6 +61,7 @@ export const config = {
   deployTimeoutMs: intEnv("DEPLOY_TIMEOUT_MS", 180_000),
   codehubPath: fromRoot("data", "codehub.yaml"),
   reposPath: fromRoot("data", "repos.yaml"),
+  dbPath: fromRoot("data", "bot.sqlite"),
 };
 
 const ENV_PATH = path.join(ROOT, ".env");

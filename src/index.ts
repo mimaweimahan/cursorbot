@@ -2,6 +2,7 @@ import { Bot } from "grammy";
 import { AuditLog } from "./audit.ts";
 import { isAllowed } from "./auth.ts";
 import { config, enrollOwner, ensureDataDirs } from "./config.ts";
+import { closeDb, getDb } from "./db.ts";
 import { AgentManager } from "./cursor/agent.ts";
 import { loadInventory } from "./inventory.ts";
 import { loadRepos } from "./repos.ts";
@@ -19,13 +20,14 @@ import {
   startEditVps,
 } from "./telegram/commands.ts";
 import { ConfirmBroker } from "./telegram/confirm.ts";
-import { CodehubWizard, runBackup, showRepoList } from "./telegram/codehub.ts";
+import { CodehubWizard, runBackup, showRepoIntro, showRepoList } from "./telegram/codehub.ts";
 import { bindDeploy, takePendingVps } from "./telegram/deployflow.ts";
 import { RepoWizard } from "./telegram/repoWizard.ts";
 import { AddVpsWizard } from "./telegram/wizard.ts";
 import { statusText } from "./codehub.ts";
 
 ensureDataDirs();
+getDb();
 
 const sessions = new SessionStore();
 const ssh = new SshPool();
@@ -38,7 +40,7 @@ const agents = new AgentManager({ ssh, confirm, audit, sessions });
 const bot = new Bot(config.telegramToken);
 confirm.setApi(bot.api);
 
-const cmdDeps = { sessions, ssh, wizard, codehub, repoWizard, audit };
+const cmdDeps = { sessions, ssh, wizard, codehub, repoWizard, audit, agents };
 
 bot.use(async (ctx, next) => {
   const uid = ctx.from?.id;
@@ -129,6 +131,18 @@ bot.on("callback_query:data", async (ctx) => {
     await runAgentTurn(ctx, bound.host, bound.prompt, { agents });
     return;
   }
+  const repoIntro = /^ri:(.+)$/.exec(data);
+  if (repoIntro?.[1]) {
+    await ctx.answerCallbackQuery();
+    await showRepoIntro(ctx, repoIntro[1]);
+    return;
+  }
+  const introEdit = /^ie:(.+)$/.exec(data);
+  if (introEdit?.[1]) {
+    await ctx.answerCallbackQuery();
+    await repoWizard.startIntro(ctx, introEdit[1]);
+    return;
+  }
   const repoEdit = /^re:(.+)$/.exec(data);
   if (repoEdit?.[1]) {
     await ctx.answerCallbackQuery();
@@ -198,6 +212,7 @@ async function shutdown(signal: string): Promise<void> {
     /* ignore */
   }
   ssh.closeAll();
+  closeDb();
   bot.stop();
   process.exit(0);
 }
@@ -217,6 +232,8 @@ await bot.api.setMyCommands([
   { command: "codehub", description: "代码仓库与密钥" },
   { command: "addrepo", description: "添加一个代码仓库" },
   { command: "cancel", description: "取消添加或取消任务" },
+  { command: "stop", description: "停止对话，不再调用 Cursor API" },
+  { command: "talk", description: "恢复对话" },
   { command: "help", description: "命令说明" },
   { command: "start", description: "开始 / 查看自己的 user id" },
 ]);

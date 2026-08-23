@@ -1,114 +1,112 @@
-import fs from "node:fs";
-import yaml from "js-yaml";
-import { parseRepoSlug } from "./codehub.ts";
-import { config } from "./config.ts";
+import { parseRepoSlug, slugsEqual } from "./codehub.ts";
+import { getDb } from "./db.ts";
 import { ID_RE } from "./inventory.ts";
 import type { CodeRepo } from "./types.ts";
 
-interface RawFile {
-  repos?: RawRepo[];
+interface RepoRow {
+  id: string;
+  name: string;
+  github_repo: string;
+  branch: string;
+  deploy_path: string;
+  deploy_cmd: string;
+  notes: string;
+  intro: string;
 }
 
-interface RawRepo {
-  id?: unknown;
-  name?: unknown;
-  githubRepo?: unknown;
-  branch?: unknown;
-  deployPath?: unknown;
-  deployCmd?: unknown;
-  notes?: unknown;
-}
-
-function asString(value: unknown, field: string): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`仓库字段 ${field} 必须是非空字符串`);
-  }
-  return value.trim();
-}
-
-function parseRepo(raw: RawRepo, index: number): CodeRepo {
-  const id = asString(raw.id, `repos[${index}].id`);
-  if (!ID_RE.test(id)) {
-    throw new Error(`repos[${index}].id="${id}" 非法，仅允许字母数字和 ._- ，最长 32`);
-  }
-  const githubRepo = asString(raw.githubRepo, `repos[${index}].githubRepo`);
-  parseRepoSlug(githubRepo);
-  const deployPath =
-    typeof raw.deployPath === "string" && raw.deployPath.trim()
-      ? raw.deployPath.trim()
-      : "/var/www/app";
-  if (!deployPath.startsWith("/") || deployPath === "/") {
-    throw new Error(`${id} 的 deployPath 必须是绝对路径，且不能是 /`);
-  }
+function rowToRepo(row: RepoRow): CodeRepo {
   return {
-    id,
-    name: typeof raw.name === "string" && raw.name.trim() ? raw.name.trim() : id,
-    githubRepo,
-    branch: typeof raw.branch === "string" && raw.branch.trim() ? raw.branch.trim() : "main",
-    deployPath,
-    deployCmd: typeof raw.deployCmd === "string" ? raw.deployCmd.trim() : "",
-    notes: typeof raw.notes === "string" ? raw.notes.trim() : "",
+    id: row.id,
+    name: row.name,
+    githubRepo: row.github_repo,
+    branch: row.branch,
+    deployPath: row.deploy_path,
+    deployCmd: row.deploy_cmd,
+    notes: row.notes,
+    intro: row.intro,
   };
 }
 
 export function loadRepos(): CodeRepo[] {
-  if (!fs.existsSync(config.reposPath)) return [];
-  const parsed = yaml.load(fs.readFileSync(config.reposPath, "utf8")) as RawFile | undefined;
-  const repos = (parsed?.repos ?? []).map(parseRepo);
-  const seen = new Set<string>();
-  for (const r of repos) {
-    if (seen.has(r.id)) throw new Error(`仓库 id 重复: ${r.id}`);
-    seen.add(r.id);
-  }
-  return repos;
+  const rows = getDb().prepare("SELECT * FROM repos ORDER BY name").all() as unknown as RepoRow[];
+  return rows.map(rowToRepo);
 }
 
 export function findRepo(idOrName: string): CodeRepo | undefined {
   const key = idOrName.trim();
-  return loadRepos().find((r) => r.id === key || r.name === key);
+  return loadRepos().find((r) => {
+    if (r.id === key || r.name === key) return true;
+    try {
+      return slugsEqual(r.githubRepo, key);
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function slugToRepoId(githubRepo: string, used: Set<string>, keep?: string): string {
+  if (keep && !used.has(keep)) return keep;
+  const { owner, repo } = parseRepoSlug(githubRepo);
+  const candidates = [repo, `${owner}-${repo}`, `r-${repo}`].map((s) =>
+    s.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+/, "").slice(0, 32),
+  );
+  for (const c of candidates) {
+    if (c && ID_RE.test(c) && !used.has(c)) return c;
+  }
+  let n = 2;
+  while (n < 1000) {
+    const c = `repo-${n}`.slice(0, 32);
+    if (!used.has(c)) return c;
+    n++;
+  }
+  throw new Error("无法生成仓库 id");
 }
 
 export function upsertRepo(repo: CodeRepo): { created: boolean } {
-  const repos = loadRepos();
-  const i = repos.findIndex((r) => r.id === repo.id);
-  if (i >= 0) {
-    repos[i] = repo;
-    saveRepos(repos);
-    return { created: false };
-  }
-  repos.push(repo);
-  saveRepos(repos);
-  return { created: true };
+  const db = getDb();
+  const clash = db.prepare("SELECT id FROM repos WHERE name = ? AND id != ?").get(repo.name, repo.id);
+  if (clash) throw new Error(`便签「${repo.name}」已经有了，每个项目便签必须唯一`);
+  const existing = db.prepare("SELECT id FROM repos WHERE id = ?").get(repo.id);
+  db.prepare(
+    `INSERT INTO repos (id,name,github_repo,branch,deploy_path,deploy_cmd,notes,intro)
+     VALUES (?,?,?,?,?,?,?,?)
+     ON CONFLICT(id) DO UPDATE SET
+       name=excluded.name, github_repo=excluded.github_repo, branch=excluded.branch,
+       deploy_path=excluded.deploy_path, deploy_cmd=excluded.deploy_cmd,
+       notes=excluded.notes, intro=excluded.intro`,
+  ).run(
+    repo.id,
+    repo.name,
+    repo.githubRepo,
+    repo.branch,
+    repo.deployPath,
+    repo.deployCmd,
+    repo.notes,
+    repo.intro,
+  );
+  return { created: !existing };
 }
 
 export function removeRepo(id: string): CodeRepo | undefined {
-  const repos = loadRepos();
-  const i = repos.findIndex((r) => r.id === id);
-  if (i < 0) return undefined;
-  const [removed] = repos.splice(i, 1);
-  saveRepos(repos);
-  return removed;
+  const repo = loadRepos().find((r) => r.id === id);
+  if (!repo) return undefined;
+  getDb().prepare("DELETE FROM repos WHERE id = ?").run(id);
+  return repo;
 }
 
 export function saveRepos(repos: CodeRepo[]): void {
-  const body = yaml.dump(
-    {
-      repos: repos.map((r) => ({
-        id: r.id,
-        name: r.name,
-        githubRepo: r.githubRepo,
-        branch: r.branch,
-        deployPath: r.deployPath,
-        ...(r.deployCmd ? { deployCmd: r.deployCmd } : {}),
-        ...(r.notes ? { notes: r.notes } : {}),
-      })),
-    },
-    { lineWidth: 120, noRefs: true, sortKeys: false },
-  );
-  fs.mkdirSync(config.reposPath.replace(/\/[^/]+$/, ""), { recursive: true });
-  fs.writeFileSync(config.reposPath, `# 代码仓库台账。成品先推 GitHub，R2 做备份。\n\n${body}`);
+  const db = getDb();
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM repos").run();
+    for (const repo of repos) upsertRepo(repo);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
 
 export function repoLine(r: CodeRepo): string {
-  return `${r.name} (${r.id})  ${r.githubRepo}@${r.branch}  → ${r.deployPath}`;
+  return r.name;
 }

@@ -11,13 +11,13 @@ const pendingVps = new Map<number, string>();
 
 export function deployPrompt(repo: CodeRepo): string {
   return [
-    `从已添加的代码仓库「${repo.name}」（id=${repo.id}）拉取成品并部署。`,
-    `GitHub: ${repo.githubRepo}  branch=${repo.branch}`,
-    `目标目录: ${repo.deployPath}`,
-    repo.deployCmd ? `部署命令: ${repo.deployCmd}` : "没有 deployCmd，只落文件、不启动服务。",
-    "必须调用工具 deploy_code，参数 repoId 填 " + repo.id + "。",
-    "GitHub 为主，失败则用 Cloudflare R2 备份。",
-    "不要在这台 VPS 上改业务代码；代码在本地客户端改完再推仓库。",
+    `用户要部署台账里的仓库「${repo.name}」。`,
+    `台账链接: ${repo.githubRepo}`,
+    `repoId: ${repo.id}`,
+    "先调用 verify_repo（repoId 必须是上面这个）向 GitHub 校验：名字/链接是否就是这个仓库。",
+    "对不上就停止，不要拉别的仓库。",
+    "校验通过后再调用 deploy_code，repoId 同样必须是 " + repo.id + "。",
+    "GitHub 为主，失败用 R2。不要在 VPS 上改业务代码。",
   ].join("\n");
 }
 

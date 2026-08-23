@@ -24,11 +24,13 @@ export interface CodeRepo {
   deployPath: string;
   deployCmd: string;
   notes: string;
+  intro: string;
 }
 
 export interface UserSession {
   currentVpsId: string | null;
   lastRepoId: string | null;
+  chatOn: boolean;
   agents: Record<string, string>;
 }
 

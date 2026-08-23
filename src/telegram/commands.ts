@@ -1,6 +1,7 @@
 import type { Bot, Context } from "grammy";
 import { InlineKeyboard } from "grammy";
 import type { AuditLog } from "../audit.ts";
+import type { AgentManager } from "../cursor/agent.ts";
 import { findHost, filterHosts, loadInventory, removeHost } from "../inventory.ts";
 import { findRepo, removeRepo } from "../repos.ts";
 import type { SessionStore } from "../session.ts";
@@ -22,6 +23,7 @@ export interface CommandDeps {
   codehub: CodehubWizard;
   repoWizard: RepoWizard;
   audit: AuditLog;
+  agents: AgentManager;
 }
 
 export function registerCommands(bot: Bot, deps: CommandDeps): void {
@@ -31,6 +33,8 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
         "VPS 运维 Bot。底部是菜单。",
         `你的 user id: ${ctx.from?.id}`,
         "",
+        "不用进入 VPS 也能直接对话。",
+        "要操作某台机器时再点「进入VPS」。",
         "先「添加仓库」再「添加VPS」。部署时选仓库，由 Cursor 拉代码。",
       ].join("\n"),
       menuReply(),
@@ -81,6 +85,14 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
     await leaveVps(ctx, deps);
   });
 
+  bot.command("stop", async (ctx) => {
+    await stopChat(ctx, deps);
+  });
+
+  bot.command("talk", async (ctx) => {
+    await resumeChat(ctx, deps);
+  });
+
   bot.command("who", async (ctx) => {
     await showWho(ctx, deps);
   });
@@ -115,6 +127,12 @@ export async function handleMenuText(ctx: Context, text: string, deps: CommandDe
       return;
     case Menu.leave:
       await leaveVps(ctx, deps);
+      return;
+    case Menu.stop:
+      await stopChat(ctx, deps);
+      return;
+    case Menu.talk:
+      await resumeChat(ctx, deps);
       return;
     case Menu.code:
       await showCodehubMenu(ctx);
@@ -189,6 +207,7 @@ export async function enterVps(ctx: Context, idOrName: string, deps: CommandDeps
     return null;
   }
   deps.sessions.setCurrent(ctx.from.id, host.id);
+  deps.sessions.setChatOn(ctx.from.id, true);
   await ctx.reply(
     [
       `已进入 ${hostLine(host)}`,
@@ -196,7 +215,7 @@ export async function enterVps(ctx: Context, idOrName: string, deps: CommandDeps
       host.writable
         ? "可写。直接发运维需求即可，例如：磁盘为什么满了、重启 nginx、看 error log。"
         : "只读。只能查，不能改。",
-      "离开: 点「离开VPS」",
+      "停止对话（不再调用 Cursor API）: 点「停止对话」  离开: 点「离开VPS」",
     ]
       .filter(Boolean)
       .join("\n"),
@@ -248,19 +267,66 @@ async function leaveVps(ctx: Context, deps: CommandDeps): Promise<void> {
   if (!ctx.from) return;
   const session = deps.sessions.get(ctx.from.id);
   if (!session.currentVpsId) {
-    await ctx.reply("当前不在任何 VPS 会话里。", menuReply());
+    await ctx.reply(
+      session.chatOn
+        ? "当前就是本机对话，直接发消息即可。"
+        : "未进入 VPS，对话也已停止，没有调用 Cursor API。点「开始对话」或「进入VPS」。",
+      menuReply(),
+    );
     return;
   }
   const left = session.currentVpsId;
   deps.sessions.setCurrent(ctx.from.id, null);
-  await ctx.reply(`已离开 ${left}。`, menuReply());
+  await ctx.reply(
+    session.chatOn
+      ? `已离开 ${left}，回到本机对话。直接发消息即可。`
+      : `已离开 ${left}。对话仍是停止状态，不会调用 Cursor API。点「开始对话」继续。`,
+    menuReply(),
+  );
+}
+
+export async function stopChat(ctx: Context, deps: CommandDeps): Promise<void> {
+  if (!ctx.from) return;
+  const session = deps.sessions.get(ctx.from.id);
+  const { cancelled } = await deps.agents.stop(ctx.from.id);
+  deps.sessions.setChatOn(ctx.from.id, false);
+  const where = session.currentVpsId ? `仍在 ${session.currentVpsId}，但` : "";
+  await ctx.reply(
+    [
+      cancelled ? "已打断当前 Cursor 任务。" : "当前没有进行中的 Cursor 任务。",
+      `${where}对话已停止，不再调用 Cursor API。`,
+      "菜单（列表、备份、部署）照常可用。要点「开始对话」或再「进入VPS」才会重新调用。",
+    ].join("\n"),
+    menuReply(),
+  );
+}
+
+export async function resumeChat(ctx: Context, deps: CommandDeps): Promise<void> {
+  if (!ctx.from) return;
+  deps.sessions.setChatOn(ctx.from.id, true);
+  const session = deps.sessions.get(ctx.from.id);
+  if (session.currentVpsId) {
+    await ctx.reply(`已恢复对话，仍在 ${session.currentVpsId}。直接发运维需求即可。`, menuReply());
+    return;
+  }
+  await ctx.reply("已恢复本机对话。直接发消息即可。要操作机器，点「进入VPS」。", menuReply());
 }
 
 async function showWho(ctx: Context, deps: CommandDeps): Promise<void> {
   if (!ctx.from) return;
   const session = deps.sessions.get(ctx.from.id);
   if (!session.currentVpsId) {
-    await ctx.reply("未进入 VPS。点「VPS列表」再进入。", menuReply());
+    const agentId = session.agents.local;
+    await ctx.reply(
+      [
+        "当前：本机对话（未进入 VPS）",
+        session.chatOn
+          ? "直接发消息即可。要操作某台机器，点「进入VPS」。"
+          : "对话已停止，不会调用 Cursor API。点「开始对话」或「进入VPS」。",
+        agentId ? `Agent: ${agentId}` : "Agent: 尚未创建（发一条消息后会启动）",
+      ].join("\n"),
+      menuReply(),
+    );
     return;
   }
   const host = findHost(session.currentVpsId);
@@ -272,6 +338,9 @@ async function showWho(ctx: Context, deps: CommandDeps): Promise<void> {
   await ctx.reply(
     [
       `当前 VPS: ${hostLine(host)}`,
+      session.chatOn
+        ? "对话开启，发消息会调用 Cursor API。"
+        : "对话已停止，发消息不会调用 Cursor API。点「开始对话」恢复。",
       agentId ? `Agent: ${agentId}` : "Agent: 尚未创建（发一条消息后会启动）",
       host.notes ? `备注: ${host.notes}` : "",
     ]
@@ -311,8 +380,12 @@ export const HELP = [
   "流程：本地改代码 → 推 GitHub（R2 备份）→ 先添加仓库 → 再添加 VPS → 部署时选仓库。",
   "Cursor 只负责往新机器拉代码、跑部署命令，不在 VPS 上改业务代码。",
   "",
+  "R2 备份名称必须对齐：一个便签 = 一个 GitHub 仓库 = projects/{便签}/latest.tar.gz。",
+  "不用 GitHub 仓库名当 R2 名，也不另起项目名。改便签等于换路径。",
+  "",
   "底部菜单：VPS 与「代码仓库 / 添加仓库」。",
   "每台 VPS、每个仓库的 id 必须唯一。",
+  "台账（VPS、简介、密钥密文）在 data/bot.sqlite，跟 bot 仓库一起 git 同步。换机器：git pull + 同一份 .env（尤其 VPS_SECRET）。不同步到 R2。",
   "",
   "/codehub      仓库与密钥",
   "/editvps [id] 编辑机器",
@@ -321,8 +394,12 @@ export const HELP = [
   "/exit         离开",
   "/status [id]  SSH 探测",
   "/cancel       取消添加或取消当前任务",
+  "/stop         停止对话，不再调用 Cursor API",
+  "/talk         恢复对话",
   "",
-  "进入后直接说话，例如：「磁盘为什么满了」",
+  "没进入 VPS 时直接说话，走本机 Cursor 对话。",
+  "进入后说话才是远程运维，例如：「磁盘为什么满了」",
+  "在 VPS 里要点「停止对话」，立刻停掉当前调用，之后也不再打 Cursor API。",
 ].join("\n");
 
 export async function confirmDeleteRepo(ctx: Context, id: string): Promise<void> {

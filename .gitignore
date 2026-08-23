@@ -6,5 +6,9 @@ data/codehub.yaml
 data/repos.yaml
 data/sessions.json
 data/audit.jsonl
+data/bot.log
+data/*.sqlite-wal
+data/*.sqlite-shm
+data/*.sqlite-journal
 workspaces/*
 !workspaces/.gitkeep

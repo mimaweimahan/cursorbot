@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram VPS ops bot (@aboutcursor_bot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegrambot
+ExecStart=/usr/local/bin/node /root/telegrambot/node_modules/tsx/dist/cli.mjs src/index.ts
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=20
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=telegrambot
+
+[Install]
+WantedBy=multi-user.target

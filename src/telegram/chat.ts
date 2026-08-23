@@ -63,19 +63,91 @@ export function registerChat(
     }
 
     const session = deps.sessions.get(ctx.from.id);
+    if (!session.chatOn) {
+      await ctx.reply(
+        "对话已停止，没有调用 Cursor API。点「开始对话」继续，或「进入VPS」操作机器。",
+        menuReply(),
+      );
+      return;
+    }
     if (!session.currentVpsId) {
-      await ctx.reply("还没进入 VPS。点「VPS列表」或「添加VPS」。", menuReply());
+      await runLocalAgentTurn(ctx, text, deps);
       return;
     }
     const host = findHost(session.currentVpsId);
     if (!host) {
-      await ctx.reply(`列表里没有 ${session.currentVpsId}，已退出会话。`, menuReply());
+      await ctx.reply(`列表里没有 ${session.currentVpsId}，已回到本机对话。`, menuReply());
       deps.sessions.setCurrent(ctx.from.id, null);
+      await runLocalAgentTurn(ctx, text, deps);
       return;
     }
 
     await runAgentTurn(ctx, host, text, deps);
   });
+}
+
+export async function runLocalAgentTurn(
+  ctx: Context,
+  text: string,
+  deps: { agents: AgentManager },
+): Promise<void> {
+  if (!ctx.from || !ctx.chat) return;
+
+  let statusMsg;
+  try {
+    statusMsg = await ctx.reply("本机对话处理中…");
+  } catch {
+    return;
+  }
+
+  let lastSent = "";
+  let lastAt = 0;
+  const flush = async (view: StreamView) => {
+    const body = renderView("本机", view);
+    const now = Date.now();
+    if (body === lastSent || now - lastAt < 800) return;
+    lastSent = body;
+    lastAt = now;
+    try {
+      await ctx.api.editMessageText(ctx.chat!.id, statusMsg.message_id, clipTelegram(body));
+    } catch {
+      /* ignore */
+    }
+  };
+
+  try {
+    const result = await deps.agents.sendLocal({
+      userId: ctx.from.id,
+      chatId: ctx.chat.id,
+      text,
+      onUpdate: flush,
+    });
+    const finalText =
+      result.text.trim() ||
+      (result.status === "finished" ? "(无文本回复)" : `任务结束: ${result.status}`);
+    const header = result.tools.length ? `🔧 ${result.tools.join(" → ")}\n\n` : "";
+    const chunks = splitTelegram(`[本机] ${result.status}\n${header}${finalText}`);
+    await ctx.api
+      .editMessageText(ctx.chat.id, statusMsg.message_id, chunks[0]!)
+      .catch(async () => {
+        await ctx.reply(chunks[0]!);
+      });
+    for (const extra of chunks.slice(1)) {
+      await ctx.reply(extra);
+    }
+  } catch (err) {
+    const message =
+      err instanceof BusyError
+        ? err.message
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    await ctx.api
+      .editMessageText(ctx.chat.id, statusMsg.message_id, `失败: ${clipTelegram(message)}`)
+      .catch(async () => {
+        await ctx.reply(`失败: ${message}`);
+      });
+  }
 }
 
 export async function runAgentTurn(

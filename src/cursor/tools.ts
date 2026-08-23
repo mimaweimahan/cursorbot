@@ -4,7 +4,8 @@ import { dangerousReason, isDangerousCommand, isDangerousPath } from "../dangero
 import { formatExec, type SshPool } from "../ssh/client.ts";
 import type { VpsHost } from "../types.ts";
 import type { ConfirmBroker } from "../telegram/confirm.ts";
-import { deployToVps, backupRepoToR2 } from "../deploy.ts";
+import { deployToVps, backupRepoToR2, resolveCodeRepo } from "../deploy.ts";
+import { formatRepoCheck, verifyListedRepo } from "../github.ts";
 
 interface ToolDeps {
   vps: VpsHost;
@@ -276,6 +277,37 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     },
   };
 
+  const verify_repo: SDKCustomTool = {
+    description:
+      "向 GitHub 校验台账里的仓库名字和链接是否就是要部署的那个仓库。部署前必须先调用。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        repoId: { type: "string", description: "已添加仓库的 id" },
+      },
+    },
+    async execute(args) {
+      const repoId =
+        (typeof args.repoId === "string" && args.repoId.trim()) || lastRepoId || "";
+      try {
+        const listed = resolveCodeRepo(repoId || undefined);
+        if (lastRepoId && listed.id !== lastRepoId) {
+          return toolError(
+            `不是当前要部署的仓库。用户选的是 ${lastRepoId}，请求的是 ${listed.id}。`,
+          );
+        }
+        const info = await verifyListedRepo(listed);
+        const text = formatRepoCheck(listed, info);
+        audit.write({ userId, vpsId: vps.id, action: "verify_repo", detail: listed.githubRepo, ok: true });
+        return text;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        audit.write({ userId, vpsId: vps.id, action: "verify_repo", ok: false, error: message });
+        return toolError(message);
+      }
+    },
+  };
+
   const deploy_code: SDKCustomTool = {
     description:
       `把已添加仓库的成品代码部署到 VPS ${vps.id}。GitHub 为主，失败用 R2。必须先在 Bot 里添加仓库。`,
@@ -289,13 +321,18 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
       const repoId =
         (typeof args.repoId === "string" && args.repoId.trim()) || lastRepoId || "";
       try {
+        const listed = resolveCodeRepo(repoId || undefined);
+        if (lastRepoId && listed.id !== lastRepoId) {
+          return toolError(`不是当前要部署的仓库。用户选的是 ${lastRepoId}，请求的是 ${listed.id}。`);
+        }
+        const info = await verifyListedRepo(listed);
         const ok = await confirm.ask(
           chatId,
-          `确认把仓库 ${repoId || "?"} 部署到 ${vps.id}（${vps.name}）？`,
+          `校验通过，确认部署到 ${vps.id}（${vps.name}）？\n\n${formatRepoCheck(listed, info)}`,
         );
         if (!ok) return toolError("用户取消了部署。");
-        const text = await deployToVps(ssh, vps, repoId || undefined);
-        audit.write({ userId, vpsId: vps.id, action: "deploy_code", detail: repoId, ok: true });
+        const text = await deployToVps(ssh, vps, listed.id);
+        audit.write({ userId, vpsId: vps.id, action: "deploy_code", detail: listed.githubRepo, ok: true });
         return text;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -306,7 +343,7 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
   };
 
   const backup_to_r2: SDKCustomTool = {
-    description: "把已添加的仓库从 GitHub 备份到 Cloudflare R2。",
+    description: "把已添加仓库从 GitHub 备份到 R2。对象名必须对齐便签：projects/{便签}/latest.tar.gz，不另起名称。",
     inputSchema: {
       type: "object",
       properties: {
@@ -336,6 +373,7 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     service,
     logs,
     metrics,
+    verify_repo,
     deploy_code,
     backup_to_r2,
   };

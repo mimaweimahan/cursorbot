@@ -1,7 +1,9 @@
+import fs from "node:fs";
+import path from "node:path";
 import { config } from "./config.ts";
-import { githubDownloadTarball } from "./github.ts";
+import { githubDownloadTarball, githubDownloadTarballToFile, verifyListedRepo } from "./github.ts";
 import { findRepo, loadRepos } from "./repos.ts";
-import { r2GetTarball, r2PutTarball } from "./r2.ts";
+import { r2GetTarball, r2PutTarball, r2PutTarballFile } from "./r2.ts";
 import { formatExec, type SshPool } from "./ssh/client.ts";
 import type { CodeRepo, VpsHost } from "./types.ts";
 
@@ -19,16 +21,27 @@ export function resolveCodeRepo(repoId?: string): CodeRepo {
 
 export async function backupRepoToR2(repoId?: string): Promise<string> {
   const rec = resolveCodeRepo(repoId);
-  const tar = await githubDownloadTarball(rec.githubRepo, rec.branch);
-  const key = await r2PutTarball(tar, rec.githubRepo, rec.branch);
-  return `已备份 ${rec.name} ${rec.githubRepo}@${rec.branch} → R2 ${key}（${tar.length} 字节）`;
+  console.log(`[backup] verify github ${rec.name}`);
+  const info = await verifyListedRepo(rec);
+  const dest = path.join(config.workspacesDir, "tmp", `backup-${rec.id}.tar.gz`);
+  console.log(`[backup] download ${info.fullName}@${info.defaultBranch} -> disk`);
+  try {
+    const bytes = await githubDownloadTarballToFile(rec.githubRepo, info.defaultBranch, dest);
+    console.log(`[backup] tarball ${bytes} bytes, upload R2`);
+    const key = await r2PutTarballFile(dest, rec);
+    console.log(`[backup] uploaded ${key}`);
+    return `已备份「${rec.name}」 ${info.fullName}@${info.defaultBranch}\n对齐路径 R2 ${key}（${bytes} 字节）\n名称已与便签对齐，没有另起 R2 项目名。`;
+  } finally {
+    fs.rmSync(dest, { force: true });
+  }
 }
 
 export async function deployToVps(ssh: SshPool, vps: VpsHost, repoId?: string): Promise<string> {
   if (!vps.writable) throw new Error("只读机器不能部署");
   const rec = resolveCodeRepo(repoId);
+  const info = await verifyListedRepo(rec);
   const repo = rec.githubRepo;
-  const branch = rec.branch;
+  const branch = info.defaultBranch;
   const deployPath = rec.deployPath || "/var/www/app";
   if (!deployPath.startsWith("/") || deployPath === "/") {
     throw new Error("deployPath 必须是绝对路径，且不能是 /");
@@ -40,15 +53,15 @@ export async function deployToVps(ssh: SshPool, vps: VpsHost, repoId?: string): 
     tar = await githubDownloadTarball(repo, branch);
     steps.push(`GitHub 已下载 ${tar.length} 字节`);
     try {
-      const key = await r2PutTarball(tar, repo, branch);
-      steps.push(`已同步备份到 R2 ${key}`);
+      const key = await r2PutTarball(tar, rec);
+      steps.push(`已同步备份到 R2 ${key}（便签 ${rec.name}）`);
     } catch (err) {
       steps.push(`R2 备份跳过: ${err instanceof Error ? err.message : String(err)}`);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    steps.push(`GitHub 失败: ${msg}，改走 R2`);
-    tar = await r2GetTarball(repo, branch);
+    steps.push(`GitHub 失败: ${msg}，改走 R2 便签「${rec.name}」`);
+    tar = await r2GetTarball(rec);
     source = "r2";
     steps.push(`R2 已下载 ${tar.length} 字节`);
   }

@@ -1,7 +1,5 @@
-import fs from "node:fs";
-import yaml from "js-yaml";
-import { config } from "./config.ts";
 import { decryptSecret, encryptSecret, isEncryptedSecret } from "./crypto.ts";
+import { getDb } from "./db.ts";
 
 export interface CodehubConfig {
   githubRepo: string;
@@ -36,9 +34,11 @@ function encMaybe(value: string, existingEnc: string): string {
 
 export function loadCodehub(): CodehubConfig {
   const base = emptyCodehub();
-  if (!fs.existsSync(config.codehubPath)) return base;
-  const raw = yaml.load(fs.readFileSync(config.codehubPath, "utf8")) as Record<string, unknown> | undefined;
-  if (!raw || typeof raw !== "object") return base;
+  const row = getDb().prepare("SELECT value FROM settings WHERE key = ?").get("codehub") as
+    | { value: string }
+    | undefined;
+  if (!row?.value) return base;
+  const raw = JSON.parse(row.value) as Record<string, unknown>;
   const str = (k: string) => (typeof raw[k] === "string" ? raw[k].trim() : "");
   let githubTokenEnc = str("githubTokenEnc");
   let r2AccessKeyEnc = str("r2AccessKeyEnc");
@@ -71,24 +71,42 @@ export function loadCodehub(): CodehubConfig {
 }
 
 export function saveCodehub(cfg: CodehubConfig): void {
-  const body = yaml.dump(
-    {
-      githubRepo: cfg.githubRepo,
-      githubBranch: cfg.githubBranch || "main",
-      githubTokenEnc: cfg.githubTokenEnc,
-      r2AccountId: cfg.r2AccountId,
-      r2AccessKeyEnc: cfg.r2AccessKeyEnc,
-      r2SecretEnc: cfg.r2SecretEnc,
-      r2Bucket: cfg.r2Bucket,
-      r2Endpoint: cfg.r2Endpoint,
-    },
-    { lineWidth: 120, noRefs: true, sortKeys: false },
-  );
-  fs.mkdirSync(config.codehubPath.replace(/\/[^/]+$/, ""), { recursive: true });
-  fs.writeFileSync(
-    config.codehubPath,
-    `# GitHub 主仓 + Cloudflare R2 备份。token/密钥已加密。\n\n${body}`,
-  );
+  const value = JSON.stringify({
+    githubRepo: cfg.githubRepo,
+    githubBranch: cfg.githubBranch || "main",
+    githubTokenEnc: cfg.githubTokenEnc,
+    r2AccountId: cfg.r2AccountId,
+    r2AccessKeyEnc: cfg.r2AccessKeyEnc,
+    r2SecretEnc: cfg.r2SecretEnc,
+    r2Bucket: cfg.r2Bucket,
+    r2Endpoint: cfg.r2Endpoint,
+  });
+  getDb()
+    .prepare(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .run("codehub", value);
+}
+
+export function applyR2Provision(
+  cfg: CodehubConfig,
+  r2: {
+    r2AccountId: string;
+    r2AccessKey: string;
+    r2Secret: string;
+    r2Bucket: string;
+    r2Endpoint: string;
+  },
+): CodehubConfig {
+  return {
+    ...cfg,
+    r2AccountId: r2.r2AccountId,
+    r2AccessKeyEnc: encryptSecret(r2.r2AccessKey),
+    r2SecretEnc: encryptSecret(r2.r2Secret),
+    r2Bucket: r2.r2Bucket,
+    r2Endpoint: r2.r2Endpoint,
+  };
 }
 
 export function mergeCodehubPatch(fields: Record<string, string>): CodehubConfig {
@@ -118,12 +136,27 @@ export function r2Secret(cfg = loadCodehub()): string {
 }
 
 export function parseRepoSlug(input: string): { owner: string; repo: string } {
-  const t = input.trim().replace(/\.git$/, "");
+  const t = input
+    .trim()
+    .replace(/[?#].*$/, "")
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "");
   const m =
     /github\.com[:/]([^/]+)\/([^/]+)$/i.exec(t) ||
     /^([^/]+)\/([^/]+)$/.exec(t);
-  if (!m) throw new Error("仓库格式应为 owner/repo 或 GitHub URL");
-  return { owner: m[1]!, repo: m[2]! };
+  if (!m) throw new Error("仓库格式应为 GitHub 链接，例如 https://github.com/owner/repo");
+  return { owner: m[1]!, repo: m[2]!.replace(/\.git$/i, "") };
+}
+
+export function normalizeGithubUrl(input: string): string {
+  const { owner, repo } = parseRepoSlug(input);
+  return `https://github.com/${owner}/${repo}`;
+}
+
+export function slugsEqual(a: string, b: string): boolean {
+  const x = parseRepoSlug(a);
+  const y = parseRepoSlug(b);
+  return x.owner.toLowerCase() === y.owner.toLowerCase() && x.repo.toLowerCase() === y.repo.toLowerCase();
 }
 
 export function r2Ready(cfg = loadCodehub()): boolean {
@@ -137,6 +170,7 @@ export function githubReady(cfg = loadCodehub()): boolean {
 export function statusText(cfg = loadCodehub()): string {
   return [
     `GitHub token: ${cfg.githubTokenEnc ? "已加密" : "未配置"}`,
+    `台账: SQLite（跟 git 走，不进 R2）`,
     `R2: ${cfg.r2Bucket || "未配置"}  account=${cfg.r2AccountId || "无"}  key=${cfg.r2SecretEnc ? "已加密" : "无"}`,
     cfg.r2Endpoint ? `endpoint: ${cfg.r2Endpoint}` : "",
   ]

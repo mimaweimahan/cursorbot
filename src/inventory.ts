@@ -1,116 +1,60 @@
-import fs from "node:fs";
-import yaml from "js-yaml";
-import { config } from "./config.ts";
 import { encryptSecret, isEncryptedSecret } from "./crypto.ts";
+import { getDb } from "./db.ts";
 import type { VpsHost } from "./types.ts";
-
-interface RawFile {
-  hosts?: RawHost[];
-}
-
-interface RawHost {
-  id?: unknown;
-  name?: unknown;
-  host?: unknown;
-  port?: unknown;
-  user?: unknown;
-  identityFile?: unknown;
-  passwordEnc?: unknown;
-  password?: unknown;
-  tags?: unknown;
-  notes?: unknown;
-  writable?: unknown;
-  allowedServices?: unknown;
-  repo?: unknown;
-  branch?: unknown;
-  deployPath?: unknown;
-  deployCmd?: unknown;
-}
 
 export const ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,31}$/;
 
-function asString(value: unknown, field: string): string {
-  if (typeof value !== "string" || !value.trim()) {
-    throw new Error(`VPS 台账字段 ${field} 必须是非空字符串`);
-  }
-  return value.trim();
+interface VpsRow {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  identity_file: string;
+  password_enc: string;
+  tags_json: string;
+  notes: string;
+  writable: number;
+  allowed_services_json: string | null;
+  repo: string;
+  branch: string;
+  deploy_path: string;
+  deploy_cmd: string;
 }
 
-function parseHost(raw: RawHost, index: number): { host: VpsHost; migrated: boolean } {
-  const id = asString(raw.id, `hosts[${index}].id`);
-  if (!ID_RE.test(id)) {
-    throw new Error(
-      `hosts[${index}].id="${id}" 非法，仅允许字母数字和 ._- ，最长 32`,
-    );
-  }
-  const tags = Array.isArray(raw.tags)
-    ? raw.tags.map((t, i) => asString(t, `hosts[${index}].tags[${i}]`))
-    : [];
-  const allowedServices = Array.isArray(raw.allowedServices)
-    ? raw.allowedServices.map((s, i) =>
-        asString(s, `hosts[${index}].allowedServices[${i}]`),
-      )
-    : null;
-  const identityFile =
-    typeof raw.identityFile === "string" ? raw.identityFile.trim() : "";
-  let passwordEnc =
-    typeof raw.passwordEnc === "string" ? raw.passwordEnc.trim() : "";
-  let migrated = false;
-  if (typeof raw.password === "string" && raw.password) {
-    passwordEnc = encryptSecret(raw.password);
-    migrated = true;
-  }
-  if (passwordEnc && !isEncryptedSecret(passwordEnc)) {
-    passwordEnc = encryptSecret(passwordEnc);
-    migrated = true;
-  }
-  if (!identityFile && !passwordEnc) {
-    throw new Error(`${id} 需要 password / passwordEnc 或 identityFile`);
-  }
+function rowToHost(row: VpsRow): VpsHost {
   return {
-    host: {
-      id,
-      name: asString(raw.name ?? raw.id, `hosts[${index}].name`),
-      host: asString(raw.host, `hosts[${index}].host`),
-      port: raw.port === undefined ? 22 : Number(raw.port),
-      user: asString(raw.user, `hosts[${index}].user`),
-      identityFile,
-      passwordEnc,
-      tags,
-      notes: typeof raw.notes === "string" ? raw.notes.trim() : "",
-      writable: raw.writable !== false,
-      allowedServices,
-      repo: typeof raw.repo === "string" ? raw.repo.trim() : "",
-      branch: typeof raw.branch === "string" ? raw.branch.trim() : "",
-      deployPath: typeof raw.deployPath === "string" ? raw.deployPath.trim() : "",
-      deployCmd: typeof raw.deployCmd === "string" ? raw.deployCmd.trim() : "",
-    },
-    migrated,
+    id: row.id,
+    name: row.name,
+    host: row.host,
+    port: Number(row.port),
+    user: row.user,
+    identityFile: row.identity_file,
+    passwordEnc: row.password_enc,
+    tags: JSON.parse(row.tags_json || "[]") as string[],
+    notes: row.notes,
+    writable: row.writable !== 0,
+    allowedServices: row.allowed_services_json
+      ? (JSON.parse(row.allowed_services_json) as string[])
+      : null,
+    repo: row.repo,
+    branch: row.branch,
+    deployPath: row.deploy_path,
+    deployCmd: row.deploy_cmd,
   };
 }
 
+function normalizeHost(host: VpsHost): VpsHost {
+  let passwordEnc = host.passwordEnc;
+  if (passwordEnc && !isEncryptedSecret(passwordEnc)) {
+    passwordEnc = encryptSecret(passwordEnc);
+  }
+  return { ...host, passwordEnc };
+}
+
 export function loadInventory(): VpsHost[] {
-  if (!fs.existsSync(config.inventoryPath)) {
-    return [];
-  }
-  const text = fs.readFileSync(config.inventoryPath, "utf8");
-  const parsed = yaml.load(text) as RawFile | undefined;
-  const parsedHosts = (parsed?.hosts ?? []).map(parseHost);
-  const hosts = parsedHosts.map((p) => p.host);
-  const seen = new Set<string>();
-  for (const h of hosts) {
-    if (seen.has(h.id)) {
-      throw new Error(`VPS id 重复: ${h.id}`);
-    }
-    seen.add(h.id);
-    if (!Number.isInteger(h.port) || h.port < 1 || h.port > 65535) {
-      throw new Error(`${h.id} 的 port 非法`);
-    }
-  }
-  if (parsedHosts.some((p) => p.migrated)) {
-    saveInventory(hosts);
-  }
-  return hosts;
+  const rows = getDb().prepare("SELECT * FROM vps ORDER BY id").all() as unknown as VpsRow[];
+  return rows.map(rowToHost);
 }
 
 export function findHost(idOrName: string): VpsHost | undefined {
@@ -145,55 +89,54 @@ export function validateId(id: string): string | undefined {
 }
 
 export function upsertHost(host: VpsHost): { created: boolean } {
-  const hosts = loadInventory();
-  const idx = hosts.findIndex((h) => h.id === host.id);
-  const created = idx < 0;
-  if (idx >= 0) hosts[idx] = host;
-  else hosts.push(host);
-  saveInventory(hosts);
-  return { created };
+  const h = normalizeHost(host);
+  const db = getDb();
+  const existing = db.prepare("SELECT id FROM vps WHERE id = ?").get(h.id);
+  db.prepare(
+    `INSERT INTO vps (id,name,host,port,user,identity_file,password_enc,tags_json,notes,writable,allowed_services_json,repo,branch,deploy_path,deploy_cmd)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(id) DO UPDATE SET
+       name=excluded.name, host=excluded.host, port=excluded.port, user=excluded.user,
+       identity_file=excluded.identity_file, password_enc=excluded.password_enc,
+       tags_json=excluded.tags_json, notes=excluded.notes, writable=excluded.writable,
+       allowed_services_json=excluded.allowed_services_json, repo=excluded.repo,
+       branch=excluded.branch, deploy_path=excluded.deploy_path, deploy_cmd=excluded.deploy_cmd`,
+  ).run(
+    h.id,
+    h.name,
+    h.host,
+    h.port,
+    h.user,
+    h.identityFile,
+    h.passwordEnc,
+    JSON.stringify(h.tags),
+    h.notes,
+    h.writable ? 1 : 0,
+    h.allowedServices ? JSON.stringify(h.allowedServices) : null,
+    h.repo,
+    h.branch,
+    h.deployPath,
+    h.deployCmd,
+  );
+  return { created: !existing };
 }
 
 export function removeHost(id: string): VpsHost | undefined {
-  const hosts = loadInventory();
-  const idx = hosts.findIndex((h) => h.id === id);
-  if (idx < 0) return undefined;
-  const [removed] = hosts.splice(idx, 1);
-  saveInventory(hosts);
-  return removed;
+  const host = loadInventory().find((h) => h.id === id);
+  if (!host) return undefined;
+  getDb().prepare("DELETE FROM vps WHERE id = ?").run(id);
+  return host;
 }
 
 export function saveInventory(hosts: VpsHost[]): void {
-  const doc = {
-    hosts: hosts.map((h) => {
-      const row: Record<string, unknown> = {
-        id: h.id,
-        name: h.name,
-        host: h.host,
-        port: h.port,
-        user: h.user,
-        writable: h.writable,
-      };
-      if (h.passwordEnc) row.passwordEnc = h.passwordEnc;
-      if (h.identityFile) row.identityFile = h.identityFile;
-      if (h.tags.length) row.tags = h.tags;
-      if (h.notes) row.notes = h.notes;
-      if (h.allowedServices?.length) row.allowedServices = h.allowedServices;
-      if (h.repo) row.repo = h.repo;
-      if (h.branch) row.branch = h.branch;
-      if (h.deployPath) row.deployPath = h.deployPath;
-      if (h.deployCmd) row.deployCmd = h.deployCmd;
-      return row;
-    }),
-  };
-  const body = yaml.dump(doc, {
-    lineWidth: 120,
-    noRefs: true,
-    sortKeys: false,
-  });
-  fs.mkdirSync(config.inventoryPath.replace(/\/[^/]+$/, ""), { recursive: true });
-  fs.writeFileSync(
-    config.inventoryPath,
-    `# 由 Bot 菜单维护，也可手工编辑后保存。\n\n${body}`,
-  );
+  const db = getDb();
+  db.exec("BEGIN");
+  try {
+    db.prepare("DELETE FROM vps").run();
+    for (const host of hosts) upsertHost(host);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
 }
