@@ -4,12 +4,21 @@ import { randomBytes } from "node:crypto";
 import dotenv from "dotenv";
 import { fromRoot, ROOT } from "./paths.ts";
 
-dotenv.config({ path: path.join(ROOT, ".env"), override: true });
+const ENV_PATH = path.join(ROOT, ".env");
+const RUNTIME_ENV_PATH = fromRoot("data", "runtime.env");
+const VPS_SECRET_PATH = fromRoot("data", "vps.secret");
+
+// 私密仓库可提交 data/runtime.env：新机 clone 后无需再手填。
+// 本地 .env 优先覆盖（便于临时改 token / 模型）。
+dotenv.config({ path: RUNTIME_ENV_PATH });
+dotenv.config({ path: ENV_PATH, override: true });
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) {
-    throw new Error(`缺少环境变量 ${name}，请复制 .env.example 为 .env 并填好`);
+    throw new Error(
+      `缺少环境变量 ${name}。请配置 data/runtime.env 或 .env（私密部署建议提交 runtime.env）`,
+    );
   }
   return value;
 }
@@ -64,26 +73,51 @@ export const config = {
   dbPath: fromRoot("data", "bot.sqlite"),
 };
 
-const ENV_PATH = path.join(ROOT, ".env");
-
-function upsertEnv(name: string, value: string): void {
-  let text = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
+function upsertEnvFile(filePath: string, name: string, value: string): void {
+  let text = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
   const line = `${name}=${value}`;
   if (new RegExp(`^${name}=`, "m").test(text)) {
     text = text.replace(new RegExp(`^${name}=.*$`, "m"), line);
   } else {
     text = text.replace(/\s*$/, "") + `\n${line}\n`;
   }
-  fs.writeFileSync(ENV_PATH, text, { mode: 0o600 });
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, text, { mode: 0o600 });
+}
+
+function upsertEnv(name: string, value: string): void {
+  upsertEnvFile(ENV_PATH, name, value);
+}
+
+function readSecretFile(filePath: string, name: string): string {
+  if (!fs.existsSync(filePath)) return "";
+  const text = fs.readFileSync(filePath, "utf8");
+  const m = text.match(new RegExp(`^${name}=(.*)$`, "m"));
+  return m?.[1]?.trim() ?? text.trim();
 }
 
 function loadOrCreateVpsSecret(): string {
-  const existing = process.env.VPS_SECRET?.trim();
-  if (existing && existing.length >= 16) return existing;
+  const fromEnv = process.env.VPS_SECRET?.trim();
+  if (fromEnv && fromEnv.length >= 16) {
+    upsertEnvFile(VPS_SECRET_PATH, "VPS_SECRET", fromEnv);
+    upsertEnvFile(RUNTIME_ENV_PATH, "VPS_SECRET", fromEnv);
+    return fromEnv;
+  }
+  const fromFile =
+    readSecretFile(VPS_SECRET_PATH, "VPS_SECRET") ||
+    readSecretFile(RUNTIME_ENV_PATH, "VPS_SECRET");
+  if (fromFile && fromFile.length >= 16) {
+    process.env.VPS_SECRET = fromFile;
+    upsertEnv("VPS_SECRET", fromFile);
+    console.log("已从 data/vps.secret（或 runtime.env）恢复 VPS_SECRET");
+    return fromFile;
+  }
   const secret = randomBytes(32).toString("hex");
   process.env.VPS_SECRET = secret;
   upsertEnv("VPS_SECRET", secret);
-  console.log("已生成 VPS_SECRET 并写入 .env（用于加密 SSH 密码）");
+  upsertEnvFile(VPS_SECRET_PATH, "VPS_SECRET", secret);
+  upsertEnvFile(RUNTIME_ENV_PATH, "VPS_SECRET", secret);
+  console.log("已生成 VPS_SECRET 并写入 .env / data/vps.secret / data/runtime.env");
   return secret;
 }
 
