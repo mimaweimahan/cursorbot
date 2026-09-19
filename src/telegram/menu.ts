@@ -8,9 +8,11 @@ export const Menu = {
   remove: "删除VPS",
   status: "探测状态",
   who: "当前会话",
+  track: "跟踪对话",
   leave: "离开VPS",
   stop: "停止对话",
   talk: "开始对话",
+  reset: "重置对话",
   code: "代码仓库",
   addRepo: "添加仓库",
   help: "帮助",
@@ -34,10 +36,14 @@ export function mainKeyboard(): Keyboard {
     .text(Menu.status)
     .row()
     .text(Menu.who)
+    .text(Menu.track)
+    .row()
     .text(Menu.leave)
     .row()
     .text(Menu.stop)
     .text(Menu.talk)
+    .row()
+    .text(Menu.reset)
     .row()
     .text(Menu.code)
     .text(Menu.addRepo)

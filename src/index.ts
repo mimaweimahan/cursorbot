@@ -20,6 +20,7 @@ import {
   startEditVps,
 } from "./telegram/commands.ts";
 import { ConfirmBroker } from "./telegram/confirm.ts";
+import { startConcurrentPolling } from "./telegram/poll.ts";
 import { CodehubWizard, runBackup, showRepoIntro, showRepoList } from "./telegram/codehub.ts";
 import { bindDeploy, takePendingVps } from "./telegram/deployflow.ts";
 import { RepoWizard } from "./telegram/repoWizard.ts";
@@ -28,8 +29,8 @@ import { statusText } from "./codehub.ts";
 
 ensureDataDirs();
 getDb();
-
 const sessions = new SessionStore();
+sessions.rehydrateAfterRestart();
 const ssh = new SshPool();
 const confirm = new ConfirmBroker();
 const audit = new AuditLog();
@@ -53,7 +54,7 @@ bot.use(async (ctx, next) => {
       await ctx.reply(`未授权。你的 Telegram user id 是 ${uid ?? "未知"}。把它加到 TELEGRAM_ALLOWED_IDS。`);
     }
     if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: "未授权", show_alert: true });
+      await ctx.answerCallbackQuery({ text: "未授权", show_alert: true }).catch(() => undefined);
     }
     return;
   }
@@ -61,7 +62,7 @@ bot.use(async (ctx, next) => {
 });
 
 registerCommands(bot, cmdDeps);
-registerChat(bot, { ...cmdDeps, agents });
+registerChat(bot, { ...cmdDeps, agents, confirm });
 
 bot.on("callback_query:data", async (ctx) => {
   const data = ctx.callbackQuery.data;
@@ -191,21 +192,35 @@ bot.on("callback_query:data", async (ctx) => {
   }
   const cf = /^cf:([0-9a-f]+):([01])$/.exec(data);
   if (cf) {
-    const handled = await confirm.handle(cf[1]!, cf[2] === "1");
-    await ctx.answerCallbackQuery({
-      text: handled ? (cf[2] === "1" ? "已确认" : "已取消") : "已失效",
-    });
+    const ok = cf[2] === "1";
+    const alive = confirm.peek(cf[1]!);
+    console.log(`confirm click id=${cf[1]} ok=${ok} alive=${alive}`);
+    // 先落地确认，再应答 Telegram。answer 失败（query too old）也不能丢掉点击。
+    if (alive) confirm.handle(cf[1]!, ok);
+    await ctx
+      .answerCallbackQuery({
+        text: alive ? (ok ? "已同意，开始执行" : "已拒绝") : "这条确认已失效（超时或已处理）",
+        show_alert: !alive,
+      })
+      .catch(() => undefined);
     return;
   }
-  await ctx.answerCallbackQuery();
+  await ctx.answerCallbackQuery().catch(() => undefined);
 });
 
 bot.catch((err) => {
   console.error("bot error", err);
 });
 
+let stopPolling: (() => Promise<void>) | undefined;
+
 async function shutdown(signal: string): Promise<void> {
   console.log(`收到 ${signal}，退出`);
+  try {
+    await stopPolling?.();
+  } catch {
+    /* ignore */
+  }
   try {
     await agents.closeAll();
   } catch {
@@ -213,7 +228,6 @@ async function shutdown(signal: string): Promise<void> {
   }
   ssh.closeAll();
   closeDb();
-  bot.stop();
   process.exit(0);
 }
 
@@ -229,20 +243,20 @@ await bot.api.setMyCommands([
   { command: "exit", description: "离开当前 VPS" },
   { command: "status", description: "探测机器状态" },
   { command: "who", description: "当前会话" },
+  { command: "track", description: "跟踪对话进度与最近操作" },
   { command: "codehub", description: "代码仓库与密钥" },
   { command: "addrepo", description: "添加一个代码仓库" },
   { command: "cancel", description: "取消添加或取消任务" },
   { command: "stop", description: "停止对话，不再调用 Cursor API" },
   { command: "talk", description: "恢复对话" },
+  { command: "reset", description: "重置对话（作废确认、换新 Agent）" },
   { command: "help", description: "命令说明" },
   { command: "start", description: "开始 / 查看自己的 user id" },
 ]);
 
 console.log(
-  `白名单 ${config.allowedIds.length} 人，台账 ${loadInventory().length} 台 VPS，${loadRepos().length} 个仓库`,
+  `白名单 ${config.allowedIds.length} 人，台账 ${loadInventory().length} 台 VPS，${loadRepos().length} 个仓库；已重置过期 Agent，对话已重新打开`,
 );
-await bot.start({
-  onStart: (info) => {
-    console.log(`以 @${info.username} 登录`);
-  },
+stopPolling = await startConcurrentPolling(bot, (info) => {
+  console.log(`以 @${info.username} 登录（并发轮询，确认按钮可即时处理）`);
 });

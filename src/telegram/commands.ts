@@ -93,8 +93,16 @@ export function registerCommands(bot: Bot, deps: CommandDeps): void {
     await resumeChat(ctx, deps);
   });
 
+  bot.command("reset", async (ctx) => {
+    await resetConversation(ctx, deps);
+  });
+
   bot.command("who", async (ctx) => {
     await showWho(ctx, deps);
+  });
+
+  bot.command("track", async (ctx) => {
+    await showTrack(ctx, deps);
   });
 
   bot.command("status", async (ctx) => {
@@ -125,6 +133,9 @@ export async function handleMenuText(ctx: Context, text: string, deps: CommandDe
     case Menu.who:
       await showWho(ctx, deps);
       return;
+    case Menu.track:
+      await showTrack(ctx, deps);
+      return;
     case Menu.leave:
       await leaveVps(ctx, deps);
       return;
@@ -133,6 +144,9 @@ export async function handleMenuText(ctx: Context, text: string, deps: CommandDe
       return;
     case Menu.talk:
       await resumeChat(ctx, deps);
+      return;
+    case Menu.reset:
+      await resetConversation(ctx, deps);
       return;
     case Menu.code:
       await showCodehubMenu(ctx);
@@ -305,21 +319,48 @@ export async function resumeChat(ctx: Context, deps: CommandDeps): Promise<void>
   if (!ctx.from) return;
   deps.sessions.setChatOn(ctx.from.id, true);
   const session = deps.sessions.get(ctx.from.id);
+  const track = deps.agents.getTrackStatus(ctx.from.id);
   if (session.currentVpsId) {
-    await ctx.reply(`已恢复对话，仍在 ${session.currentVpsId}。直接发运维需求即可。`, menuReply());
+    await ctx.reply(
+      [
+        `已恢复对话，仍在 ${session.currentVpsId}。直接发运维需求即可。`,
+        track.awaitingConfirm ? "还有一条危险操作等你点「同意执行」或「拒绝」。" : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      menuReply(),
+    );
     return;
   }
   await ctx.reply("已恢复本机对话。直接发消息即可。要操作机器，点「进入VPS」。", menuReply());
 }
 
+export async function resetConversation(ctx: Context, deps: CommandDeps): Promise<void> {
+  if (!ctx.from) return;
+  await deps.agents.stop(ctx.from.id);
+  const session = deps.sessions.resetConversation(ctx.from.id);
+  const where = session.currentVpsId ? `仍在 ${session.currentVpsId}` : "本机对话";
+  await ctx.reply(
+    [
+      `对话已重置（${where}）。`,
+      "旧任务和确认按钮已作废，Cursor Agent 会重新创建。",
+      "直接发需求即可。检查类问题先只看不改；要改再说「修复」。",
+    ].join("\n"),
+    menuReply(),
+  );
+}
+
 async function showWho(ctx: Context, deps: CommandDeps): Promise<void> {
   if (!ctx.from) return;
   const session = deps.sessions.get(ctx.from.id);
+  const track = deps.agents.getTrackStatus(ctx.from.id);
+  const scene = describeScene(session.currentVpsId, session.chatOn, track);
   if (!session.currentVpsId) {
     const agentId = session.agents.local;
     await ctx.reply(
       [
         "当前：本机对话（未进入 VPS）",
+        `场景: ${scene}`,
         session.chatOn
           ? "直接发消息即可。要操作某台机器，点「进入VPS」。"
           : "对话已停止，不会调用 Cursor API。点「开始对话」或「进入VPS」。",
@@ -338,6 +379,7 @@ async function showWho(ctx: Context, deps: CommandDeps): Promise<void> {
   await ctx.reply(
     [
       `当前 VPS: ${hostLine(host)}`,
+      `场景: ${scene}`,
       session.chatOn
         ? "对话开启，发消息会调用 Cursor API。"
         : "对话已停止，发消息不会调用 Cursor API。点「开始对话」恢复。",
@@ -348,6 +390,76 @@ async function showWho(ctx: Context, deps: CommandDeps): Promise<void> {
       .join("\n"),
     menuReply(),
   );
+}
+
+function describeScene(
+  vpsId: string | null,
+  chatOn: boolean,
+  track: { busy: boolean; awaitingConfirm: boolean; phase?: string },
+): string {
+  if (track.awaitingConfirm) return "⏳ 等你点「同意执行」或「拒绝」";
+  if (track.busy && track.phase === "executing") return "▶️ 已同意，正在执行";
+  if (track.busy) return "🟡 处理中";
+  if (!chatOn) return "对话已停止";
+  if (vpsId) return `在 ${vpsId}，空闲`;
+  return "本机空闲";
+}
+
+export async function showTrack(ctx: Context, deps: CommandDeps): Promise<void> {
+  if (!ctx.from) return;
+  const session = deps.sessions.get(ctx.from.id);
+  const track = deps.agents.getTrackStatus(ctx.from.id);
+  const scope = session.currentVpsId ?? "本机";
+  const agentKey = session.currentVpsId ?? "local";
+  const agentId = session.agents[agentKey];
+
+  const lines: string[] = ["📡 对话跟踪", ""];
+  lines.push(`位置: ${scope}`);
+  lines.push(`对话: ${session.chatOn ? "开启" : "已停止"}`);
+  if (agentId) lines.push(`Agent: ${agentId}`);
+
+  if (track.awaitingConfirm) {
+    lines.push("");
+    lines.push(`状态: ⏳ 等你确认${track.remainSec ? `（还剩 ${track.remainSec}s）` : ""}`);
+    lines.push("请点「同意执行」或「拒绝」。点完后会立刻继续，不会卡住。");
+  } else if (track.busy) {
+    const elapsed = track.elapsedSec ?? 0;
+    lines.push("");
+    lines.push(`状态: 🟡 处理中 (${elapsed}s)`);
+    if (track.prompt) lines.push(`问题: ${track.prompt}`);
+    lines.push("处理消息会实时更新；也可继续发新消息（会自动停上一条）。");
+  } else {
+    lines.push("");
+    lines.push("状态: 🟢 空闲");
+  }
+
+  const recent = deps.audit.recentForUser(ctx.from.id, 10);
+  const dialog = recent.filter((e) =>
+    /^(agent\.|exec|read_file|list_dir|logs|metrics|service|deploy)/.test(e.action),
+  );
+  if (dialog.length) {
+    lines.push("");
+    lines.push("最近操作:");
+    for (const e of dialog.slice(-8)) {
+      const t = formatTrackTime(e.ts);
+      const mark = e.ok ? "✓" : "✗";
+      const where = e.vpsId ?? "?";
+      const detail = e.detail ? `: ${e.detail.slice(0, 60)}` : "";
+      lines.push(`${t} ${mark} [${where}] ${e.action}${detail}`);
+      if (!e.ok && e.error) lines.push(`    ↳ ${e.error.slice(0, 80)}`);
+    }
+  } else {
+    lines.push("");
+    lines.push("最近操作: （暂无）");
+  }
+
+  await ctx.reply(clipTelegram(lines.join("\n")), menuReply());
+}
+
+function formatTrackTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "??:??";
+  return d.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 async function probeStatus(ctx: Context, deps: CommandDeps, arg?: string): Promise<void> {
@@ -393,13 +505,15 @@ export const HELP = [
   "/enter <id>   进入",
   "/exit         离开",
   "/status [id]  SSH 探测",
+  "/track        跟踪当前对话与最近操作",
   "/cancel       取消添加或取消当前任务",
   "/stop         停止对话，不再调用 Cursor API",
   "/talk         恢复对话",
+  "/reset        重置对话（作废确认、换新 Agent，仍留在当前 VPS）",
   "",
   "没进入 VPS 时直接说话，走本机 Cursor 对话。",
-  "进入后说话才是远程运维，例如：「磁盘为什么满了」",
-  "在 VPS 里要点「停止对话」，立刻停掉当前调用，之后也不再打 Cursor API。",
+  "进入后说话才是远程运维。说「检查」只看不改；说「修复」才会改，危险操作要你点「同意执行」。",
+  "点同意后处理消息会变成「正在执行」，不会停在转圈。",
 ].join("\n");
 
 export async function confirmDeleteRepo(ctx: Context, id: string): Promise<void> {

@@ -1,7 +1,8 @@
 import type { Bot, Context } from "grammy";
-import { AgentManager, BusyError, type StreamView } from "../cursor/agent.ts";
+import { AgentManager, BusyError, type AgentResult, type StreamView } from "../cursor/agent.ts";
 import { findHost } from "../inventory.ts";
 import type { VpsHost } from "../types.ts";
+import type { ConfirmBroker } from "./confirm.ts";
 import {
   ENTER_RE,
   enterVps,
@@ -14,7 +15,7 @@ import { menuReply } from "./menu.ts";
 
 export function registerChat(
   bot: Bot,
-  deps: CommandDeps & { agents: AgentManager },
+  deps: CommandDeps & { agents: AgentManager; confirm: ConfirmBroker },
 ): void {
   bot.command("cancel", async (ctx) => {
     if (!ctx.from) return;
@@ -40,6 +41,22 @@ export function registerChat(
       deps.codehub.cancel(ctx.from.id);
       deps.repoWizard.cancel(ctx.from.id);
       await handleMenuText(ctx, text, deps);
+      return;
+    }
+
+    if (deps.confirm.hasPending(ctx.from.id)) {
+      const remain = deps.confirm.remainSec(ctx.from.id);
+      await ctx.reply(
+        [
+          "有一条危险操作正在等你确认。",
+          remain ? `还剩约 ${remain} 秒。` : "",
+          "请先点消息上的「同意执行」或「拒绝」。",
+          "不想执行的话，点「停止对话」会作废这条确认。",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        menuReply(),
+      );
       return;
     }
 
@@ -102,8 +119,9 @@ export async function runLocalAgentTurn(
 
   let lastSent = "";
   let lastAt = 0;
+  const startedAt = Date.now();
   const flush = async (view: StreamView) => {
-    const body = renderView("本机", view);
+    const body = renderView("本机", view, startedAt);
     const now = Date.now();
     if (body === lastSent || now - lastAt < 800) return;
     lastSent = body;
@@ -122,19 +140,7 @@ export async function runLocalAgentTurn(
       text,
       onUpdate: flush,
     });
-    const finalText =
-      result.text.trim() ||
-      (result.status === "finished" ? "(无文本回复)" : `任务结束: ${result.status}`);
-    const header = result.tools.length ? `🔧 ${result.tools.join(" → ")}\n\n` : "";
-    const chunks = splitTelegram(`[本机] ${result.status}\n${header}${finalText}`);
-    await ctx.api
-      .editMessageText(ctx.chat.id, statusMsg.message_id, chunks[0]!)
-      .catch(async () => {
-        await ctx.reply(chunks[0]!);
-      });
-    for (const extra of chunks.slice(1)) {
-      await ctx.reply(extra);
-    }
+    await deliverAgentResult(ctx, statusMsg.message_id, "本机", result);
   } catch (err) {
     const message =
       err instanceof BusyError
@@ -167,8 +173,9 @@ export async function runAgentTurn(
 
   let lastSent = "";
   let lastAt = 0;
+  const startedAt = Date.now();
   const flush = async (view: StreamView) => {
-    const body = renderView(host.id, view);
+    const body = renderView(host.id, view, startedAt);
     const now = Date.now();
     if (body === lastSent || now - lastAt < 800) return;
     lastSent = body;
@@ -188,19 +195,7 @@ export async function runAgentTurn(
       text,
       onUpdate: flush,
     });
-    const finalText =
-      result.text.trim() ||
-      (result.status === "finished" ? "(无文本回复)" : `任务结束: ${result.status}`);
-    const header = result.tools.length ? `🔧 ${result.tools.join(" → ")}\n\n` : "";
-    const chunks = splitTelegram(`[${host.id}] ${result.status}\n${header}${finalText}`);
-    await ctx.api
-      .editMessageText(ctx.chat.id, statusMsg.message_id, chunks[0]!)
-      .catch(async () => {
-        await ctx.reply(chunks[0]!);
-      });
-    for (const extra of chunks.slice(1)) {
-      await ctx.reply(extra);
-    }
+    await deliverAgentResult(ctx, statusMsg.message_id, host.id, result);
   } catch (err) {
     const message =
       err instanceof BusyError
@@ -216,9 +211,71 @@ export async function runAgentTurn(
   }
 }
 
-function renderView(vpsId: string, view: StreamView): string {
+function renderView(vpsId: string, view: StreamView, startedAt?: number): string {
+  const elapsed =
+    startedAt !== undefined
+      ? `⏱ ${Math.max(0, Math.floor((Date.now() - startedAt) / 1000))}s\n`
+      : "";
+  if (view.phase === "waiting_confirm") {
+    const remain = view.remainSec !== undefined ? `还剩 ${view.remainSec}s。` : "";
+    const snippet = view.waitingConfirm
+      ? `\n${view.waitingConfirm.slice(0, 500)}`
+      : "";
+    return `[${vpsId}]\n${elapsed}⏳ 等你点「同意执行」或「拒绝」。${remain}\n点了之后这条消息会立刻变成「正在执行」，不会卡住。${snippet}`;
+  }
+  if (view.phase === "executing" && !view.text) {
+    const tools = view.tools.length ? `🔧 ${view.tools.join(" → ")}\n` : "";
+    return `[${vpsId}]\n${elapsed}▶️ 已同意，正在执行…\n${tools}`;
+  }
   const tools = view.tools.length ? `🔧 ${view.tools.join(" → ")}\n` : "";
   const thinking = view.thinking && !view.text ? "思考中…\n" : "";
-  const text = view.text.trim() || "处理中…";
-  return `[${vpsId}]\n${tools}${thinking}${text}`;
+  const err = view.error && !view.text ? `⚠️ ${view.error}\n` : "";
+  const text = view.text.trim() || (view.error ? "" : "处理中…");
+  return `[${vpsId}]\n${elapsed}${tools}${thinking}${err}${text}`;
+}
+
+async function deliverAgentResult(
+  ctx: Context,
+  statusMessageId: number,
+  scope: string,
+  result: AgentResult,
+): Promise<void> {
+  if (!ctx.chat) return;
+  if (result.superseded) {
+    await ctx.api
+      .editMessageText(ctx.chat.id, statusMessageId, `[${scope}] 已切换到新消息`)
+      .catch(() => undefined);
+    return;
+  }
+  const chunks = splitTelegram(formatAgentReply(scope, result));
+  await ctx.api
+    .editMessageText(ctx.chat.id, statusMessageId, chunks[0]!)
+    .catch(async () => {
+      await ctx.reply(chunks[0]!);
+    });
+  for (const extra of chunks.slice(1)) {
+    await ctx.reply(extra);
+  }
+  // 编辑旧消息手机通常不提醒；再发一条新消息才会响铃/出横幅。
+  const ping =
+    result.status === "finished"
+      ? `✅ [${scope}] 执行完成，结果已写在上一条。`
+      : result.status === "cancelled"
+        ? `🚫 [${scope}] 已取消。`
+        : `⚠️ [${scope}] 未正常结束（${result.status}）`;
+  await ctx.reply(ping, menuReply()).catch(() => undefined);
+}
+
+function formatAgentReply(scope: string, result: AgentResult): string {
+  const header = result.tools.length ? `🔧 ${result.tools.join(" → ")}\n\n` : "";
+  const body = result.text.trim();
+  const prefix = result.interruptedPrevious ? "⏹ 已停止上一条，\n" : "";
+  if (result.status === "finished") {
+    return `${prefix}[${scope}] 执行完成\n${header}${body || "(无文本回复)"}`;
+  }
+  const reason =
+    body ||
+    result.error ||
+    (result.status === "cancelled" ? "任务已取消" : `任务异常结束 (${result.status})`);
+  return `${prefix}[${scope}] ${result.status}\n${header}${reason}`;
 }

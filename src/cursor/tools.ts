@@ -1,6 +1,6 @@
 import type { SDKCustomTool } from "@cursor/sdk";
 import type { AuditLog } from "../audit.ts";
-import { dangerousReason, isDangerousCommand, isDangerousPath } from "../dangerous.ts";
+import { dangerousReason, isDangerousCommand, needsWriteConfirm } from "../dangerous.ts";
 import { formatExec, type SshPool } from "../ssh/client.ts";
 import type { VpsHost } from "../types.ts";
 import type { ConfirmBroker } from "../telegram/confirm.ts";
@@ -60,6 +60,7 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
         const ok = await confirm.ask(
           chatId,
           `危险操作（${dangerousReason(command)}）\n机器: ${vps.id}\n命令:\n${command}`,
+          { userId },
         );
         if (!ok) {
           audit.write({ userId, vpsId: vps.id, action: "exec", detail: command, ok: false, error: "cancelled" });
@@ -123,10 +124,11 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
       }
       const remotePath = str(args, "path");
       const content = typeof args.content === "string" ? args.content : String(args.content ?? "");
-      if (isDangerousPath(remotePath)) {
+      if (needsWriteConfirm(remotePath)) {
         const ok = await confirm.ask(
           chatId,
-          `即将覆盖敏感文件\n机器: ${vps.id}\n路径: ${remotePath}\n大小: ${content.length} 字符`,
+          `即将写入生产文件\n机器: ${vps.id}\n路径: ${remotePath}\n大小: ${content.length} 字符`,
+          { userId },
         );
         if (!ok) {
           audit.write({ userId, vpsId: vps.id, action: "write_file", detail: remotePath, ok: false, error: "cancelled" });
@@ -197,6 +199,7 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
         const ok = await confirm.ask(
           chatId,
           `即将 systemctl ${action} ${name}\n机器: ${vps.id}`,
+          { userId },
         );
         if (!ok) {
           audit.write({ userId, vpsId: vps.id, action: "service", detail: `${action} ${name}`, ok: false, error: "cancelled" });
@@ -329,6 +332,7 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
         const ok = await confirm.ask(
           chatId,
           `校验通过，确认部署到 ${vps.id}（${vps.name}）？\n\n${formatRepoCheck(listed, info)}`,
+          { userId },
         );
         if (!ok) return toolError("用户取消了部署。");
         const text = await deployToVps(ssh, vps, listed.id);

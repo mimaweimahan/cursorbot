@@ -56,7 +56,7 @@ export const config = {
   sshTimeoutMs: intEnv("SSH_TIMEOUT_MS", 20_000),
   cmdTimeoutMs: intEnv("CMD_TIMEOUT_MS", 30_000),
   cmdMaxOutput: intEnv("CMD_MAX_OUTPUT", 8_000),
-  confirmTimeoutMs: intEnv("CONFIRM_TIMEOUT_MS", 60_000),
+  confirmTimeoutMs: intEnv("CONFIRM_TIMEOUT_MS", 180_000),
   readFileMaxBytes: intEnv("READ_FILE_MAX_BYTES", 200 * 1024),
   deployTimeoutMs: intEnv("DEPLOY_TIMEOUT_MS", 180_000),
   codehubPath: fromRoot("data", "codehub.yaml"),

@@ -61,6 +61,24 @@ export class SessionStore {
     this.save();
   }
 
+  /** 进程重启后内存里的 Agent 句柄已空，SQLite 里的旧 agentId 不能 resume */
+  rehydrateAfterRestart(): void {
+    for (const session of this.data.values()) {
+      session.agents = {};
+      session.chatOn = true;
+    }
+    this.save();
+  }
+
+  /** 保持当前 VPS，清空 Agent 并重新开启对话 */
+  resetConversation(userId: number): UserSession {
+    const session = this.get(userId);
+    session.agents = {};
+    session.chatOn = true;
+    this.save();
+    return session;
+  }
+
   private load(): void {
     const rows = getDb().prepare("SELECT * FROM sessions").all() as unknown as SessionRow[];
     for (const row of rows) {
