@@ -93,7 +93,10 @@ function readSecretFile(filePath: string, name: string): string {
   if (!fs.existsSync(filePath)) return "";
   const text = fs.readFileSync(filePath, "utf8");
   const m = text.match(new RegExp(`^${name}=(.*)$`, "m"));
-  return m?.[1]?.trim() ?? text.trim();
+  if (m?.[1]?.trim()) return m[1].trim();
+  // 兼容 data/vps.secret 仅存裸密钥、无 KEY= 前缀
+  if (name === "VPS_SECRET" && !text.includes("=")) return text.trim();
+  return "";
 }
 
 function loadOrCreateVpsSecret(): string {
