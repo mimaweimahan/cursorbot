@@ -220,21 +220,27 @@ export async function enterVps(ctx: Context, idOrName: string, deps: CommandDeps
     await ctx.reply(`找不到机器「${idOrName}」。台账: ${all}`, menuReply());
     return null;
   }
+  const prev = deps.sessions.get(ctx.from.id).currentVpsId;
   deps.sessions.setCurrent(ctx.from.id, host.id);
   deps.sessions.setChatOn(ctx.from.id, true);
-  await ctx.reply(
-    [
-      `已进入 ${hostLine(host)}`,
-      host.notes ? `备注: ${host.notes}` : "",
-      host.writable
-        ? "可写。直接发运维需求即可，例如：磁盘为什么满了、重启 nginx、看 error log。"
-        : "只读。只能查，不能改。",
-      "停止对话（不再调用 Cursor API）: 点「停止对话」  离开: 点「离开VPS」",
-    ]
-      .filter(Boolean)
-      .join("\n"),
-    menuReply(),
-  );
+  // 切换机器时丢弃上一台的进行中任务，避免串台
+  if (prev && prev !== host.id) {
+    await deps.agents.cancel(ctx.from.id);
+  }
+
+  const probe = await deps.ssh.probe(host);
+  const lines = [
+    `已进入 ${hostLine(host)}`,
+    host.notes ? `备注: ${host.notes}` : "",
+    host.writable
+      ? "可写。直接发运维需求即可，例如：磁盘为什么满了、重启 nginx、看 error log。"
+      : "只读。只能查，不能改。",
+    probe.ok
+      ? "SSH 探测：通"
+      : `SSH 探测：不通 — ${probe.error}\n先修好网络/防火墙/端口后再问，否则远程工具会立刻熔断返回。`,
+    "停止对话（不再调用 Cursor API）: 点「停止对话」  离开: 点「离开VPS」",
+  ];
+  await ctx.reply(lines.filter(Boolean).join("\n"), menuReply());
   return host;
 }
 

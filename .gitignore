@@ -10,5 +10,7 @@ data/bot.log
 data/*.sqlite-wal
 data/*.sqlite-shm
 data/*.sqlite-journal
+data/embedding-cache/
+data/exports/
 workspaces/*
 !workspaces/.gitkeep

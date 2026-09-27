@@ -4,6 +4,8 @@ import { isAllowed } from "./auth.ts";
 import { config, enrollOwner, ensureDataDirs } from "./config.ts";
 import { closeDb, getDb } from "./db.ts";
 import { AgentManager } from "./cursor/agent.ts";
+import { bootstrapKnowledge } from "./knowledge/bootstrap.ts";
+import { closeKnowledgeDb } from "./knowledge/db.ts";
 import { loadInventory } from "./inventory.ts";
 import { loadRepos } from "./repos.ts";
 import { SessionStore } from "./session.ts";
@@ -29,6 +31,7 @@ import { statusText } from "./codehub.ts";
 
 ensureDataDirs();
 getDb();
+await bootstrapKnowledge();
 const sessions = new SessionStore();
 sessions.rehydrateAfterRestart();
 const ssh = new SshPool();
@@ -227,6 +230,7 @@ async function shutdown(signal: string): Promise<void> {
     /* ignore */
   }
   ssh.closeAll();
+  closeKnowledgeDb();
   closeDb();
   process.exit(0);
 }

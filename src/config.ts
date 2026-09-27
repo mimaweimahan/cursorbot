@@ -48,10 +48,28 @@ if (allowedIds.length === 0) {
   console.warn("TELEGRAM_ALLOWED_IDS 为空：第一个发消息的人会自动写入白名单");
 }
 
+function collectCursorApiKeys(): string[] {
+  const primary = process.env.CURSOR_API_KEY?.trim() || "";
+  const backup = process.env.CURSOR_API_KEY_BACKUP?.trim() || "";
+  // 兼容 CURSOR_API_KEY=key1,key2
+  const fromCsv = primary
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const keys = [...fromCsv];
+  if (backup && !keys.includes(backup)) keys.push(backup);
+  return keys;
+}
+
+const cursorApiKeys = collectCursorApiKeys();
+
 export const config = {
   telegramToken: required("TELEGRAM_BOT_TOKEN"),
   allowedIds,
-  cursorApiKey: process.env.CURSOR_API_KEY?.trim() || "",
+  /** 主 key（兼容旧逻辑） */
+  cursorApiKey: cursorApiKeys[0] || "",
+  /** 主 + 备用，按顺序故障切换 */
+  cursorApiKeys,
   cursorModel: process.env.CURSOR_MODEL?.trim() || "composer-2.5",
   vpsSecret: "",
   inventoryPath: process.env.VPS_INVENTORY
@@ -71,6 +89,23 @@ export const config = {
   codehubPath: fromRoot("data", "codehub.yaml"),
   reposPath: fromRoot("data", "repos.yaml"),
   dbPath: fromRoot("data", "bot.sqlite"),
+  /** 可迁移知识库（playbook + 向量）；换机拷贝此文件即可 */
+  knowledgeDbPath:
+    process.env.KNOWLEDGE_DB?.trim()
+      ? path.resolve(ROOT, process.env.KNOWLEDGE_DB.trim())
+      : fromRoot("data", "knowledge.sqlite"),
+  embeddingProvider: (process.env.EMBEDDING_PROVIDER?.trim() || "auto") as
+    | "auto"
+    | "local"
+    | "openai"
+    | "none",
+  embeddingModel:
+    process.env.EMBEDDING_MODEL?.trim() ||
+    "Xenova/all-MiniLM-L6-v2",
+  embeddingBaseUrl: process.env.EMBEDDING_BASE_URL?.trim() || "https://api.openai.com/v1",
+  embeddingApiKey: process.env.EMBEDDING_API_KEY?.trim() || "",
+  embeddingCacheDir:
+    process.env.EMBEDDING_CACHE_DIR?.trim() || fromRoot("data", "embedding-cache"),
 };
 
 function upsertEnvFile(filePath: string, name: string, value: string): void {

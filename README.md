@@ -35,6 +35,15 @@ npm start
 - `/exit` 离开；`/cancel` 取消进行中的任务
 - 重启、`rm -rf`、改 `sshd` 等会要求 Telegram 按钮确认
 
+## 可迁移知识库（向量检索）
+
+运维流程存在 `data/knowledge.sqlite`（全文 + 向量），换机带走即可。详见 [docs/KNOWLEDGE.md](./docs/KNOWLEDGE.md)。
+
+```bash
+npm run knowledge:export
+npm run knowledge:import -- ./data/exports/knowledge-pack-xxx.tar.gz
+```
+
 ## 安全
 
 这是高权限 Bot。务必收紧 `TELEGRAM_ALLOWED_IDS`，私钥只放 Bot 机且权限 `600`。操作会追加到 `data/audit.jsonl`。

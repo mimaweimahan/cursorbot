@@ -21,15 +21,91 @@ interface Pooled {
   ready: Promise<Client>;
 }
 
+/** 连接失败后的熔断：避免 Agent 连续打 SSH 把对话拖成数分钟 */
+interface Unreachable {
+  until: number;
+  reason: string;
+}
+
+const UNREACHABLE_COOLDOWN_MS = 90_000;
+
 export class SshPool {
   private pool = new Map<string, Pooled>();
+  private unreachable = new Map<string, Unreachable>();
+
+  /** 进入 VPS 时探测；成功则清除熔断 */
+  async probe(vps: VpsHost): Promise<{ ok: true } | { ok: false; error: string }> {
+    this.clearUnreachable(vps.id);
+    try {
+      await this.connect(vps);
+      const r = await execOn(await this.connect(vps), "echo ok", 8_000);
+      if (r.timedOut || (r.code !== 0 && r.code !== null)) {
+        const err = `探测失败 code=${r.code} ${r.stderr || r.stdout}`.trim();
+        this.markUnreachable(vps.id, err);
+        return { ok: false, error: err };
+      }
+      return { ok: true };
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      this.markUnreachable(vps.id, error);
+      this.drop(vps.id);
+      return { ok: false, error };
+    }
+  }
+
+  clearUnreachable(vpsId: string): void {
+    this.unreachable.delete(vpsId);
+  }
+
+  getUnreachable(vpsId: string): string | null {
+    const u = this.unreachable.get(vpsId);
+    if (!u) return null;
+    if (Date.now() > u.until) {
+      this.unreachable.delete(vpsId);
+      return null;
+    }
+    return u.reason;
+  }
+
+  private markUnreachable(vpsId: string, reason: string): void {
+    this.unreachable.set(vpsId, {
+      until: Date.now() + UNREACHABLE_COOLDOWN_MS,
+      reason,
+    });
+  }
+
+  private assertReachable(vps: VpsHost): void {
+    const reason = this.getUnreachable(vps.id);
+    if (reason) {
+      throw new Error(
+        `SSH 熔断中（${vps.id}）：${reason}。约 90s 内勿再重试远程工具，请直接告知用户机器不可达。`,
+      );
+    }
+  }
+
+  private noteConnectFailure(vpsId: string, err: unknown): void {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/超时|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|Timed out|connect/i.test(msg)) {
+      this.markUnreachable(vpsId, msg);
+    }
+  }
 
   async exec(vps: VpsHost, command: string, timeoutMs = config.cmdTimeoutMs): Promise<ExecResult> {
+    this.assertReachable(vps);
     try {
       return await execOn(await this.connect(vps), command, timeoutMs);
-    } catch {
+    } catch (err) {
       this.drop(vps.id);
-      return execOn(await this.connect(vps), command, timeoutMs);
+      this.noteConnectFailure(vps.id, err);
+      // 连接超时/拒绝：不再二次重连（会把等待翻倍）
+      if (isConnectFatal(err)) throw err;
+      this.assertReachable(vps);
+      try {
+        return await execOn(await this.connect(vps), command, timeoutMs);
+      } catch (err2) {
+        this.noteConnectFailure(vps.id, err2);
+        throw err2;
+      }
     }
   }
 
@@ -38,40 +114,64 @@ export class SshPool {
   }
 
   async readFile(vps: VpsHost, remotePath: string): Promise<Buffer> {
-    const sftp = await this.sftp(vps);
-    const stat = await statPath(sftp, remotePath);
-    if (stat.isDirectory) {
-      throw new Error(`${remotePath} 是目录，请用 list_dir`);
+    this.assertReachable(vps);
+    try {
+      const sftp = await this.sftp(vps);
+      const stat = await statPath(sftp, remotePath);
+      if (stat.isDirectory) {
+        throw new Error(`${remotePath} 是目录，请用 list_dir`);
+      }
+      if (stat.size > config.readFileMaxBytes) {
+        throw new Error(
+          `文件 ${remotePath} 大小 ${stat.size} 超过上限 ${config.readFileMaxBytes} 字节`,
+        );
+      }
+      return readRemote(sftp, remotePath);
+    } catch (err) {
+      this.noteConnectFailure(vps.id, err);
+      throw err;
     }
-    if (stat.size > config.readFileMaxBytes) {
-      throw new Error(
-        `文件 ${remotePath} 大小 ${stat.size} 超过上限 ${config.readFileMaxBytes} 字节`,
-      );
-    }
-    return readRemote(sftp, remotePath);
   }
 
   async writeFile(vps: VpsHost, remotePath: string, content: string): Promise<void> {
-    const sftp = await this.sftp(vps);
-    await writeRemote(sftp, remotePath, Buffer.from(content, "utf8"));
+    this.assertReachable(vps);
+    try {
+      const sftp = await this.sftp(vps);
+      await writeRemote(sftp, remotePath, Buffer.from(content, "utf8"));
+    } catch (err) {
+      this.noteConnectFailure(vps.id, err);
+      throw err;
+    }
   }
 
   async writeBuffer(vps: VpsHost, remotePath: string, data: Buffer): Promise<void> {
-    const sftp = await this.sftp(vps);
-    await writeRemote(sftp, remotePath, data);
+    this.assertReachable(vps);
+    try {
+      const sftp = await this.sftp(vps);
+      await writeRemote(sftp, remotePath, data);
+    } catch (err) {
+      this.noteConnectFailure(vps.id, err);
+      throw err;
+    }
   }
 
   async listDir(vps: VpsHost, remotePath: string): Promise<string> {
-    const sftp = await this.sftp(vps);
-    const entries = await readdir(sftp, remotePath);
-    if (entries.length === 0) return "(空目录)";
-    const lines = entries
-      .sort((a, b) => a.filename.localeCompare(b.filename))
-      .map((e) => {
-        const kind = e.longname.startsWith("d") ? "dir " : "file";
-        return `${kind}\t${e.attrs.size}\t${e.filename}`;
-      });
-    return lines.join("\n");
+    this.assertReachable(vps);
+    try {
+      const sftp = await this.sftp(vps);
+      const entries = await readdir(sftp, remotePath);
+      if (entries.length === 0) return "(空目录)";
+      const lines = entries
+        .sort((a, b) => a.filename.localeCompare(b.filename))
+        .map((e) => {
+          const kind = e.longname.startsWith("d") ? "dir " : "file";
+          return `${kind}\t${e.attrs.size}\t${e.filename}`;
+        });
+      return lines.join("\n");
+    } catch (err) {
+      this.noteConnectFailure(vps.id, err);
+      throw err;
+    }
   }
 
   drop(vpsId: string): void {
@@ -95,12 +195,15 @@ export class SshPool {
   }
 
   private async connect(vps: VpsHost): Promise<Client> {
+    this.assertReachable(vps);
     const existing = this.pool.get(vps.id);
     if (existing) {
       try {
         return await existing.ready;
-      } catch {
+      } catch (err) {
         this.drop(vps.id);
+        this.noteConnectFailure(vps.id, err);
+        throw err;
       }
     }
 
@@ -143,8 +246,18 @@ export class SshPool {
     });
 
     this.pool.set(vps.id, { client, ready });
-    return ready;
+    try {
+      return await ready;
+    } catch (err) {
+      this.noteConnectFailure(vps.id, err);
+      throw err;
+    }
   }
+}
+
+function isConnectFatal(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /SSH 连接超时|ETIMEDOUT|ECONNREFUSED|ENETUNREACH|熔断/i.test(msg);
 }
 
 function authFields(vps: VpsHost): Pick<ConnectConfig, "password" | "privateKey"> {

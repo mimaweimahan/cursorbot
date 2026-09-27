@@ -6,6 +6,12 @@ import type { VpsHost } from "../types.ts";
 import type { ConfirmBroker } from "../telegram/confirm.ts";
 import { deployToVps, backupRepoToR2, resolveCodeRepo } from "../deploy.ts";
 import { formatRepoCheck, verifyListedRepo } from "../github.ts";
+import {
+  listPlaybookFiles,
+  readWorkspaceNote,
+  savePlaybook,
+  searchPlaybooks,
+} from "./memory.ts";
 
 interface ToolDeps {
   vps: VpsHost;
@@ -35,6 +41,19 @@ function num(args: Record<string, unknown>, key: string, fallback: number): numb
 
 function toolError(message: string) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
+}
+
+/** 禁止把 Bot 本机工作区路径当成远程路径（切 VPS 后 Agent 易混淆） */
+function rejectBotLocalPath(remotePath: string): string | null {
+  const p = remotePath.replace(/\\/g, "/");
+  if (
+    /\/telegrambot\/workspaces\b/i.test(p) ||
+    /\/root\/telegrambot\b/i.test(p) ||
+    /^workspaces\//i.test(p)
+  ) {
+    return `路径 ${remotePath} 属于 Bot 本机，不是远程 VPS。远程请用 /www、/etc、/var 等；本机记忆请用 memory_*。`;
+  }
+  return null;
 }
 
 export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
@@ -96,6 +115,8 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     },
     async execute(args) {
       const remotePath = str(args, "path");
+      const bad = rejectBotLocalPath(remotePath);
+      if (bad) return toolError(bad);
       try {
         const buf = await ssh.readFile(vps, remotePath);
         audit.write({ userId, vpsId: vps.id, action: "read_file", detail: remotePath, ok: true });
@@ -123,6 +144,8 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
         return toolError("这台机器是只读，禁止 write_file。");
       }
       const remotePath = str(args, "path");
+      const bad = rejectBotLocalPath(remotePath);
+      if (bad) return toolError(bad);
       const content = typeof args.content === "string" ? args.content : String(args.content ?? "");
       if (needsWriteConfirm(remotePath)) {
         const ok = await confirm.ask(
@@ -158,6 +181,8 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     },
     async execute(args) {
       const remotePath = str(args, "path");
+      const bad = rejectBotLocalPath(remotePath);
+      if (bad) return toolError(bad);
       try {
         const listing = await ssh.listDir(vps, remotePath);
         audit.write({ userId, vpsId: vps.id, action: "list_dir", detail: remotePath, ok: true });
@@ -369,6 +394,147 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     },
   };
 
+  /** 列库捷径：看数据目录即可，禁止 Agent 写脚本/追 root 密码 */
+  const list_mysql_dbs: SDKCustomTool = {
+    description:
+      "列出本机 MySQL 库名（读 /www/server/data 目录，秒级）。问「有几个数据库/哪些库」必须优先用本工具。禁止写 python/追宝塔 root/反复 SHOW DATABASES。",
+    inputSchema: { type: "object", properties: {} },
+    async execute() {
+      const script = [
+        "set -e",
+        'DATA="${MYSQL_DATADIR:-/www/server/data}"',
+        'if [ ! -d "$DATA" ]; then echo "NO_DATADIR $DATA"; exit 0; fi',
+        'echo "datadir=$DATA"',
+        'echo "--- all schema dirs ---"',
+        'ls -1 "$DATA" 2>/dev/null | grep -Eiv \'\\.|pem$|log$|pid$|index$|redo|temp|dblwr|^ib_|^undo_|^auto\\.cnf$|^mysql-bin|^ibdata|^ibtmp\' || true',
+        'echo "--- business (exclude system) ---"',
+        'ls -1 "$DATA" 2>/dev/null | grep -Eiv \'\\.|pem$|log$|pid$|index$|redo|temp|dblwr|^ib_|^undo_|^auto\\.cnf$|^mysql-bin|^ibdata|^ibtmp|^mysql$|^sys$|^performance_schema$|^information_schema$\' || true',
+      ].join("\n");
+      try {
+        const result = await ssh.exec(vps, script, 15_000);
+        const text = formatExec(result);
+        audit.write({ userId, vpsId: vps.id, action: "list_mysql_dbs", ok: true });
+        return text;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        audit.write({
+          userId,
+          vpsId: vps.id,
+          action: "list_mysql_dbs",
+          ok: false,
+          error: message,
+        });
+        return toolError(message);
+      }
+    },
+  };
+
+  const memory_list: SDKCustomTool = {
+    description:
+      "列出 knowledge.sqlite 中该 VPS 的 playbook。同类问题应先查记忆再 SSH。",
+    inputSchema: { type: "object", properties: {} },
+    async execute() {
+      const books = listPlaybookFiles(vps.id);
+      const lines = [
+        `VPS ${vps.id} 本机记忆`,
+        `playbooks: ${books.length} 个`,
+        ...books.map((b) => `• ${b.name} — ${b.title}`),
+      ];
+      audit.write({ userId, vpsId: vps.id, action: "memory_list", ok: true });
+      return lines.join("\n");
+    },
+  };
+
+  const memory_search: SDKCustomTool = {
+    description:
+      "向量+全文检索本机 knowledge.sqlite 中的历史流程（订单/nginx/ssl/域名等）。",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string", description: "搜索词" } },
+      required: ["query"],
+    },
+    async execute(args) {
+      try {
+        const query = str(args, "query");
+        const text = await searchPlaybooks(vps.id, query);
+        audit.write({ userId, vpsId: vps.id, action: "memory_search", detail: query, ok: true });
+        return text;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return toolError(message);
+      }
+    },
+  };
+
+  const memory_read: SDKCustomTool = {
+    description:
+      "读取记忆。path: MEMORY.md 或 playbooks/<slug>.md（数据来自 knowledge.sqlite）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "相对工作区路径，如 playbooks/foo.md" },
+      },
+      required: ["path"],
+    },
+    async execute(args) {
+      try {
+        const rel = str(args, "path");
+        const text = readWorkspaceNote(vps.id, rel);
+        audit.write({ userId, vpsId: vps.id, action: "memory_read", detail: rel, ok: true });
+        return text;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return toolError(message);
+      }
+    },
+  };
+
+  const memory_save_playbook: SDKCustomTool = {
+    description:
+      "把已验证流程写入 knowledge.sqlite 并生成向量（可迁移）。密钥密码禁止写入。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "短标题，如「近3天订单查询」" },
+        problem: { type: "string", description: "用户原问题或场景" },
+        steps: { type: "string", description: "可复用步骤：路径、SQL/命令、注意点（无密钥）" },
+        tags: { type: "string", description: "逗号分隔标签，可选" },
+      },
+      required: ["title", "problem", "steps"],
+    },
+    async execute(args) {
+      try {
+        const title = str(args, "title");
+        const problem = str(args, "problem");
+        const steps = str(args, "steps");
+        const tagsRaw = typeof args.tags === "string" ? args.tags : "";
+        const tags = tagsRaw
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean);
+        const msg = await savePlaybook(vps.id, { title, problem, steps, tags });
+        audit.write({
+          userId,
+          vpsId: vps.id,
+          action: "memory_save_playbook",
+          detail: title,
+          ok: true,
+        });
+        return msg;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        audit.write({
+          userId,
+          vpsId: vps.id,
+          action: "memory_save_playbook",
+          ok: false,
+          error: message,
+        });
+        return toolError(message);
+      }
+    },
+  };
+
   return {
     exec,
     read_file: readFile,
@@ -380,5 +546,10 @@ export function buildVpsTools(deps: ToolDeps): Record<string, SDKCustomTool> {
     verify_repo,
     deploy_code,
     backup_to_r2,
+    list_mysql_dbs,
+    memory_list,
+    memory_search,
+    memory_read,
+    memory_save_playbook,
   };
 }

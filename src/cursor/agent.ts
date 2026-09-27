@@ -15,7 +15,9 @@ import type { CodeRepo, VpsHost } from "../types.ts";
 import type { ConfirmBroker, ConfirmEvent } from "../telegram/confirm.ts";
 import type { SshPool } from "../ssh/client.ts";
 import type { SessionStore } from "../session.ts";
+import { CursorApiKeyPool } from "./api-keys.ts";
 import { buildLocalTools } from "./local-tools.ts";
+import { ensureVpsMemory, memoryIndex, recordTurn, retrieveForPrompt } from "./memory.ts";
 import { buildVpsTools } from "./tools.ts";
 
 export const LOCAL_AGENT_ID = "local";
@@ -73,9 +75,50 @@ export class AgentManager {
   /** 串行化同一用户的 send，避免并发穿透 */
   private userTail = new Map<number, Promise<void>>();
   private heartbeats = new Map<number, NodeJS.Timeout>();
+  /** 主/备 key 环形切换 + 冷却（避免长跑卡在最后一把） */
+  private readonly apiKeys = new CursorApiKeyPool(config.cursorApiKeys);
 
   constructor(private deps: AgentDeps) {
     this.deps.confirm.subscribe((ev) => this.onConfirmEvent(ev));
+    if (config.cursorApiKeys.length > 0) {
+      console.log(
+        `Cursor API key 池已加载 ${config.cursorApiKeys.length} 把（环形故障切换）`,
+      );
+    }
+  }
+
+  private currentApiKey(): string {
+    return this.apiKeys.current();
+  }
+
+  /**
+   * 切到下一把可用 key；成功则丢弃全部 Agent 句柄（旧 key 会话不可复用）。
+   * @param triedInRequest 本轮请求已试过的下标，防止环形死循环
+   */
+  private rotateApiKey(reason: unknown, triedInRequest?: Set<number>): boolean {
+    const ok = this.apiKeys.markFailedAndRotate(reason, triedInRequest);
+    if (ok) {
+      this.invalidateAllAgentHandles();
+    }
+    return ok;
+  }
+
+  /** key 切换或恢复主 key 后，关闭并清空所有缓存 Agent */
+  private invalidateAllAgentHandles(): void {
+    for (const agent of this.handles.values()) {
+      try {
+        agent.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.handles.clear();
+  }
+
+  private noteApiKeySuccess(): void {
+    if (this.apiKeys.noteSuccess()) {
+      this.invalidateAllAgentHandles();
+    }
   }
 
   isBusy(userId: number): boolean {
@@ -215,10 +258,9 @@ export class AgentManager {
       this.inflight.add(opts.userId);
       try {
         const getAgent = (forceFresh = false) => this.getAgent(opts, forceFresh);
-        const view: StreamView = { tools: [], text: "", thinking: false };
         const lastRepoId = this.deps.sessions.get(opts.userId).lastRepoId;
         const selectedRepo = lastRepoId ? findRepo(lastRepoId) : undefined;
-        const prompt = wrapPrompt(opts.vps, opts.text, selectedRepo);
+        const prompt = await wrapPrompt(opts.vps, opts.text, selectedRepo);
         const tools = buildVpsTools({
           vps: opts.vps,
           userId: opts.userId,
@@ -229,23 +271,27 @@ export class AgentManager {
           lastRepoId: lastRepoId ?? undefined,
         });
 
-        const run = await this.dispatchWithRetry(
-          opts.userId,
-          opts.vps.id,
+        const result = await this.runPromptWithKeyFailover({
+          userId: opts.userId,
+          scope: opts.vps.id,
           generation,
           getAgent,
           prompt,
           tools,
-        );
-        const result = await this.consumeRun(
-          opts.userId,
-          opts.vps.id,
-          opts.text,
-          run,
-          view,
-          opts.onUpdate,
-          generation,
-        );
+          detail: opts.text,
+          onUpdate: opts.onUpdate,
+        });
+        try {
+          recordTurn({
+            vpsId: opts.vps.id,
+            question: opts.text,
+            answer: result.text || result.error || "",
+            tools: result.tools,
+            ok: !result.error && result.status === "finished",
+          });
+        } catch (err) {
+          console.warn("recordTurn failed", err);
+        }
         return interruptedPrevious ? { ...result, interruptedPrevious } : result;
       } finally {
         this.inflight.delete(opts.userId);
@@ -273,31 +319,81 @@ export class AgentManager {
       this.inflight.add(opts.userId);
       try {
         const getAgent = (forceFresh = false) => this.getLocalAgent(opts.userId, forceFresh);
-        const view: StreamView = { tools: [], text: "", thinking: false };
         const prompt = wrapLocalPrompt(opts.text);
         const tools = buildLocalTools({ userId: opts.userId, audit: this.deps.audit });
-        const run = await this.dispatchWithRetry(
-          opts.userId,
-          LOCAL_AGENT_ID,
+        const result = await this.runPromptWithKeyFailover({
+          userId: opts.userId,
+          scope: LOCAL_AGENT_ID,
           generation,
           getAgent,
           prompt,
           tools,
-        );
-        const result = await this.consumeRun(
-          opts.userId,
-          LOCAL_AGENT_ID,
-          opts.text,
-          run,
-          view,
-          opts.onUpdate,
-          generation,
-        );
+          detail: opts.text,
+          onUpdate: opts.onUpdate,
+        });
         return interruptedPrevious ? { ...result, interruptedPrevious } : result;
       } finally {
         this.inflight.delete(opts.userId);
       }
     });
+  }
+
+  /** 发送并消费 run；额度/鉴权失败时环形切 key 重试（可从备用切回主 key） */
+  private async runPromptWithKeyFailover(opts: {
+    userId: number;
+    scope: string;
+    generation: number;
+    getAgent: (forceFresh?: boolean) => Promise<SDKAgent>;
+    prompt: string;
+    tools: Record<string, SDKCustomTool>;
+    detail: string;
+    onUpdate: (view: StreamView) => Promise<void>;
+  }): Promise<AgentResult> {
+    const keyTries = Math.max(1, this.apiKeys.size);
+    const triedKeys = new Set<number>();
+    let last: AgentResult | undefined;
+    for (let i = 0; i < keyTries; i++) {
+      if (this.isStale(opts.userId, opts.generation)) return this.emptySuperseded();
+      triedKeys.add(this.apiKeys.currentIndex);
+      const view: StreamView = { tools: [], text: "", thinking: false };
+      const run = await this.dispatchWithRetry(
+        opts.userId,
+        opts.scope,
+        opts.generation,
+        opts.getAgent,
+        opts.prompt,
+        opts.tools,
+        triedKeys,
+      );
+      last = await this.consumeRun(
+        opts.userId,
+        opts.scope,
+        opts.detail,
+        run,
+        view,
+        opts.onUpdate,
+        opts.generation,
+      );
+      if (!last.error || !isUsageLimitMessage(last.error)) {
+        this.noteApiKeySuccess();
+        return last;
+      }
+      if (i >= keyTries - 1) {
+        return {
+          ...last,
+          error: `${last.error}（已尝试 ${triedKeys.size}/${this.apiKeys.size} 把 API key，请稍后重试或检查 Cursor 用量）`,
+        };
+      }
+      if (!this.rotateApiKey(last.error, triedKeys)) {
+        return {
+          ...last,
+          error: `${last.error}（API key 均不可用，请稍后重试或检查 Cursor 用量）`,
+        };
+      }
+      this.resetAgentSession(opts.userId, opts.scope);
+      await sleep(INTERRUPT_SETTLE_MS);
+    }
+    return last ?? this.emptySuperseded();
   }
 
   private async dispatchWithRetry(
@@ -307,18 +403,31 @@ export class AgentManager {
     getAgent: (forceFresh?: boolean) => Promise<SDKAgent>,
     prompt: string,
     tools: Record<string, SDKCustomTool>,
+    triedKeys?: Set<number>,
   ): Promise<Run> {
-    const maxAttempts = 3;
+    const maxAttempts = 3 + Math.max(0, this.apiKeys.size - 1);
+    const tried = triedKeys ?? new Set<number>();
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       if (this.isStale(userId, generation)) {
         throw new SupersededError();
       }
+      tried.add(this.apiKeys.currentIndex);
       const forceFresh = attempt > 0;
       if (forceFresh) {
         this.resetAgentSession(userId, scope);
         await sleep(INTERRUPT_SETTLE_MS + attempt * 200);
       }
-      const agent = await getAgent(forceFresh);
+      let agent: SDKAgent;
+      try {
+        agent = await getAgent(forceFresh);
+      } catch (err) {
+        if (attempt < maxAttempts - 1 && isApiKeyError(err)) {
+          if (this.rotateApiKey(err, tried)) continue;
+          // 无法切 key：同 key 强制重建再试（瞬时鉴权抖动）
+          continue;
+        }
+        throw mapAgentError(err);
+      }
       try {
         return await agent.send(prompt, { local: { customTools: tools } });
       } catch (err) {
@@ -329,10 +438,14 @@ export class AgentManager {
           );
           continue;
         }
+        if (attempt < maxAttempts - 1 && isApiKeyError(err)) {
+          if (this.rotateApiKey(err, tried)) continue;
+          continue;
+        }
         throw mapAgentError(err);
       }
     }
-    throw new Error("Cursor Agent 繁忙，请稍后再试");
+    throw new Error("Cursor Agent 繁忙或鉴权失败，请稍后再试");
   }
 
   private async consumeRun(
@@ -556,8 +669,12 @@ export class AgentManager {
       cwd,
       customTools: tools,
     };
+    const apiKey = this.currentApiKey();
+    if (!apiKey) {
+      throw new Error("还没配置 CURSOR_API_KEY");
+    }
     const common = {
-      apiKey: config.cursorApiKey,
+      apiKey,
       model: { id: config.cursorModel },
       disallowedTools: [...DISALLOWED],
       local,
@@ -593,8 +710,12 @@ export class AgentManager {
 
     const cwd = ensureLocalWorkspace();
     const tools = buildLocalTools({ userId, audit: this.deps.audit });
+    const apiKey = this.currentApiKey();
+    if (!apiKey) {
+      throw new Error("还没配置 CURSOR_API_KEY");
+    }
     const common = {
-      apiKey: config.cursorApiKey,
+      apiKey,
       model: { id: config.cursorModel },
       disallowedTools: [...DISALLOWED],
       local: { cwd, customTools: tools },
@@ -637,6 +758,24 @@ function isAgentBusyError(err: unknown): boolean {
   return /already has active run/i.test(msg);
 }
 
+function isApiKeyError(err: unknown): boolean {
+  if (err instanceof CursorAgentError) {
+    const code = String(err.code || "").toLowerCase();
+    if (/auth|unauthorized|forbidden|api.?key|invalid.?key|billing|quota|usage|rate.?limit/.test(code)) {
+      return true;
+    }
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return isUsageLimitMessage(msg);
+}
+
+function isUsageLimitMessage(msg: string | undefined | null): boolean {
+  if (!msg) return false;
+  return /401|403|unauthorized|forbidden|invalid.?api.?key|api.?key.*(invalid|expired|revoked|missing)|authentication|insufficient.?credits|billing|quota.?exceeded|out of usage|increase (your )?limit|increase limits|usage limit|rate.?limit|spend.?limit|no (remaining )?credits/i.test(
+    msg,
+  );
+}
+
 function mapAgentError(err: unknown): Error {
   if (err instanceof SupersededError || err instanceof BusyError) return err;
   if (isAgentBusyError(err)) {
@@ -667,13 +806,16 @@ export interface AgentResult {
   interruptedPrevious?: boolean;
 }
 
-function wrapPrompt(vps: VpsHost, text: string, repo?: CodeRepo): string {
+async function wrapPrompt(vps: VpsHost, text: string, repo?: CodeRepo): Promise<string> {
+  ensureVpsMemory(vps);
+  const index = memoryIndex(vps.id);
+  const retrieved = await retrieveForPrompt(vps.id, text);
   return [
     `You are operating remote VPS "${vps.name}" (id=${vps.id}) at ${vps.user}@${vps.host}:${vps.port}.`,
     "The local workspace only contains notes/runbooks. It is NOT the server filesystem.",
     "Application code is written on a local client, then pushed to GitHub (R2 is backup). Do not rewrite app source on this VPS.",
     "R2 name must align with the 便签: one 便签 = one GitHub repo = projects/{便签}/latest.tar.gz. Never invent another R2 key.",
-    "Use custom tools only: exec, read_file, write_file, list_dir, service, logs, metrics, verify_repo, deploy_code, backup_to_r2.",
+    "Use custom tools only: exec, read_file, write_file, list_dir, service, logs, metrics, verify_repo, deploy_code, backup_to_r2, list_mysql_dbs, memory_list, memory_search, memory_read, memory_save_playbook.",
     `Writable: ${vps.writable ? "yes" : "NO, read-only machine"}.`,
     vps.allowedServices ? `Allowed systemd services: ${vps.allowedServices.join(", ")}.` : "",
     vps.notes ? `Notes: ${vps.notes}` : "",
@@ -681,8 +823,34 @@ function wrapPrompt(vps: VpsHost, text: string, repo?: CodeRepo): string {
       ? `The only allowed repo is "${repo.name}" id=${repo.id} url=${repo.githubRepo}. First verify_repo, then deploy_code. Never pull a different repo.`
       : "If asked to deploy, the user must pick an added repo. Call verify_repo then deploy_code with that repoId.",
     "",
+    "【远程路径】",
+    `- 你正在操作的是远程机 ${vps.id}（${vps.user}@${vps.host}）。exec/read_file/list_dir 的 path 必须是【远程机】上的路径（如 /www、/etc、/var/log）。`,
+    "- 禁止把 Bot 本机路径（如 /root/telegrambot/workspaces/...）传给远程工具。",
+    "- 本机 runbook 只用 memory_*；远程文件系统只用 SSH 工具。",
+    "",
+    "【查有多少数据库 — 强制简流程】",
+    "- 用户问「有几个库/哪些 mysql 数据库」：只调用一次 list_mysql_dbs，根据返回直接回答。",
+    "- 禁止：写 python、追宝塔 root 密码、bt、反复 SHOW DATABASES、读一堆 .env。",
+    "- 业务库 = 数据目录中排除 mysql/sys/performance_schema/information_schema 后的目录名。",
+    "",
+    "【SSH 失败快停】",
+    "- 若出现「SSH 连接超时」或「SSH 熔断中」：立刻停止继续调用远程工具，用中文告诉用户这台机连不上，不要换路径反复试。",
+    "- 每台机器记忆隔离：不要套用其他 VPS 的 playbook 路径/库名，除非本机 memory 明确写了。",
+    "",
+    "【记忆策略：knowledge.sqlite 按 vps_id 隔离；上下文只注入短索引+Top1】",
+    index,
+    "",
+    retrieved,
+    "",
+    "记忆规则：",
+    "1. 默认只看短索引 + 本轮 Top1；不够再 memory_search，命中后再 memory_read 单篇。",
+    "2. 禁止通读知识库 / history。",
+    "3. 参数化变体（3天/7天订单等）复用同一流程，只改参数。",
+    "4. 新流程结束后 memory_save_playbook（会写入 sqlite 并更新向量；禁止密钥）。",
+    "5. 环境速查只保留短事实。",
+    "",
     "【对话场景】",
-    "- 用户说检查/看看/排查/为什么/网络异常：只读。只用 metrics、logs、read_file、list_dir，以及只读 exec（ps/curl/grep/systemctl status/nginx -t）。禁止 write_file、禁止改 nginx/php、禁止 restart/reload、禁止删除配置。先把结论发给用户，等他们明确说「修复」。",
+    "- 用户说检查/看看/排查/为什么/网络异常：只读。只用 metrics、logs、read_file、list_dir、memory_*，以及只读 exec（ps/curl/grep/systemctl status/nginx -t）。禁止 write_file、禁止改 nginx/php、禁止 restart/reload、禁止删除配置。先把结论发给用户，等他们明确说「修复」。",
     "- 用户说修复/改/重启/部署：可以改。危险命令会弹出 Telegram「同意执行」。必须等用户点同意后再执行；点了之后立刻干活并汇报，不要沉默。",
     "- 禁止用 python/heredoc/base64/cat>/tee 绕过 Telegram 确认。改文件用 write_file，改服务用 service。",
     "- 用户点了拒绝：停止该改法，用中文总结并等待，不要立刻换一种等价写入。",
@@ -723,22 +891,5 @@ function ensureLocalWorkspace(): string {
 }
 
 function ensureWorkspace(vps: VpsHost): string {
-  const dir = path.join(config.workspacesDir, vps.id);
-  fs.mkdirSync(dir, { recursive: true });
-  const readme = path.join(dir, "README.md");
-  const body = [
-    `# ${vps.name} (${vps.id})`,
-    "",
-    `- Host: \`${vps.user}@${vps.host}:${vps.port}\``,
-    `- Writable: ${vps.writable}`,
-    vps.tags.length ? `- Tags: ${vps.tags.join(", ")}` : "",
-    vps.notes ? `- Notes: ${vps.notes}` : "",
-    "",
-    "This folder is a local runbook. Remote files live on the VPS; use SSH tools.",
-    "",
-  ]
-    .filter((l) => l !== "")
-    .join("\n");
-  fs.writeFileSync(readme, body);
-  return dir;
+  return ensureVpsMemory(vps);
 }
