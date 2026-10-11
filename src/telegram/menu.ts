@@ -15,8 +15,12 @@ export const Menu = {
   reset: "重置对话",
   code: "代码仓库",
   addRepo: "添加仓库",
+  addressLearn: "地址学习",
   help: "帮助",
 } as const;
+
+/** 各国地址格式学习站（Telegram 内嵌 WebApp，不外跳浏览器） */
+export const ADDRESS_LEARN_URL = "https://www.meiguodizhi.com/";
 
 const LABELS = new Set<string>(Object.values(Menu));
 
@@ -48,6 +52,7 @@ export function mainKeyboard(): Keyboard {
     .text(Menu.code)
     .text(Menu.addRepo)
     .row()
+    .webApp(Menu.addressLearn, ADDRESS_LEARN_URL)
     .text(Menu.help)
     .resized()
     .persistent();

@@ -501,7 +501,7 @@ export const HELP = [
   "R2 备份名称必须对齐：一个便签 = 一个 GitHub 仓库 = projects/{便签}/latest.tar.gz。",
   "不用 GitHub 仓库名当 R2 名，也不另起项目名。改便签等于换路径。",
   "",
-  "底部菜单：VPS 与「代码仓库 / 添加仓库」。",
+  "底部菜单：VPS、「代码仓库 / 添加仓库」、「地址学习」（Telegram 内嵌打开，不外跳）。",
   "每台 VPS、每个仓库的 id 必须唯一。",
   "台账（VPS、简介、密钥密文）在 data/bot.sqlite，跟 bot 仓库一起 git 同步。换机器：git pull + 同一份 .env（尤其 VPS_SECRET）。不同步到 R2。",
   "",

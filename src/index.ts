@@ -22,6 +22,7 @@ import {
   startEditVps,
 } from "./telegram/commands.ts";
 import { ConfirmBroker } from "./telegram/confirm.ts";
+import { installTelegramApiResilience } from "./telegram/api-retry.ts";
 import { startConcurrentPolling } from "./telegram/poll.ts";
 import { CodehubWizard, runBackup, showRepoIntro, showRepoList } from "./telegram/codehub.ts";
 import { bindDeploy, takePendingVps } from "./telegram/deployflow.ts";
@@ -41,7 +42,16 @@ const wizard = new AddVpsWizard(audit, ssh, sessions);
 const codehub = new CodehubWizard();
 const repoWizard = new RepoWizard(audit);
 const agents = new AgentManager({ ssh, confirm, audit, sessions });
-const bot = new Bot(config.telegramToken);
+const bot = new Bot(
+  config.telegramToken,
+  config.telegramApiRoot
+    ? { client: { apiRoot: config.telegramApiRoot } }
+    : undefined,
+);
+if (config.telegramApiRoot) {
+  console.log(`Telegram API 经反代: ${config.telegramApiRoot}`);
+}
+installTelegramApiResilience(bot);
 confirm.setApi(bot.api);
 
 const cmdDeps = { sessions, ssh, wizard, codehub, repoWizard, audit, agents };

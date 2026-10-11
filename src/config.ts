@@ -65,6 +65,8 @@ const cursorApiKeys = collectCursorApiKeys();
 
 export const config = {
   telegramToken: required("TELEGRAM_BOT_TOKEN"),
+  /** 可选。Cloudflare Worker 等反代根地址，如 https://xxx.workers.dev（不要尾斜杠） */
+  telegramApiRoot: (process.env.TELEGRAM_API_ROOT?.trim() || "").replace(/\/$/, ""),
   allowedIds,
   /** 主 key（兼容旧逻辑） */
   cursorApiKey: cursorApiKeys[0] || "",

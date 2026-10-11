@@ -7,6 +7,8 @@ data/repos.yaml
 data/sessions.json
 data/audit.jsonl
 data/bot.log
+data/watchdog.log
+data/watchdog.state
 data/*.sqlite-wal
 data/*.sqlite-shm
 data/*.sqlite-journal
